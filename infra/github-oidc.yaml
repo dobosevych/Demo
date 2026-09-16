@@ -19,7 +19,10 @@ Parameters:
     Default: "*"
     Description: >
       Which refs may assume it. "*" is any branch, tag or environment.
-      Narrow it to e.g. "ref:refs/heads/main" once the workflow is proven.
+      Note the subject depends on how the job is written: a job with an
+      `environment:` sends "environment:<name>", NOT "ref:refs/heads/<branch>".
+      deploy-backend.yml uses `environment: aws`, so narrowing this means
+      "environment:aws", not a branch ref.
   CreateOidcProvider:
     Type: String
     Default: "yes"
@@ -55,7 +58,13 @@ Resources:
         Statement:
           - Effect: Allow
             Principal:
-              Federated: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com"
+              # !Ref on an OIDCProvider returns its ARN, and creates a real
+              # dependency so it is never referenced before it exists. When the
+              # provider already existed, fall back to naming it directly.
+              Federated: !If
+                - ShouldCreateProvider
+                - !Ref GitHubOidcProvider
+                - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com"
             Action: sts:AssumeRoleWithWebIdentity
             Condition:
               StringEquals:
