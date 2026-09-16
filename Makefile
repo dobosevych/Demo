@@ -238,10 +238,17 @@ github-oidc: aws-check ## Create the IAM role GitHub Actions assumes (no stored 
 	}
 	@account=$$(aws sts get-caller-identity --query Account --output text); \
 	arn="arn:aws:iam::$$account:oidc-provider/token.actions.githubusercontent.com"; \
-	create=yes; \
-	if aws iam get-open-id-connect-provider --open-id-connect-provider-arn "$$arn" >/dev/null 2>&1; then \
+	exists=no; \
+	aws iam get-open-id-connect-provider --open-id-connect-provider-arn "$$arn" >/dev/null 2>&1 && exists=yes; \
+	mine=no; \
+	aws cloudformation describe-stack-resource --stack-name $(OIDC_STACK) \
+		--logical-resource-id GitHubOidcProvider >/dev/null 2>&1 && mine=yes; \
+	if [ "$$mine" = "yes" ]; then \
+		create=yes; \
+		echo "OIDC provider exists and this stack owns it — keeping it."; \
+	elif [ "$$exists" = "yes" ]; then \
 		create=no; \
-		echo "OIDC provider already exists — CloudFormation will not manage it."; \
+		echo "OIDC provider exists but belongs to something else — leaving it in place."; \
 		if aws iam get-open-id-connect-provider --open-id-connect-provider-arn "$$arn" \
 			--query "ClientIDList" --output text | tr '\t' '\n' | grep -qx "sts.amazonaws.com"; then \
 			echo "  audience sts.amazonaws.com: present"; \
@@ -252,6 +259,9 @@ github-oidc: aws-check ## Create the IAM role GitHub Actions assumes (no stored 
 				--client-id sts.amazonaws.com; \
 			echo "  added."; \
 		fi; \
+	else \
+		create=yes; \
+		echo "No OIDC provider yet — this stack will create one."; \
 	fi; \
 	echo "Deploying $(OIDC_STACK) for $(GITHUB_REPO) (create provider: $$create)…"; \
 	aws cloudformation deploy \
