@@ -65,7 +65,8 @@ backend_output = $(shell aws cloudformation describe-stacks \
 
 .PHONY: help aws-check frontend-build infra-deploy frontend-sync frontend-invalidate \
         frontend-deploy frontend-url frontend-status frontend-events frontend-destroy \
-        purge-failed-stack explain-failure env-export clean cert cert-wait github-oidc \
+        purge-failed-stack explain-failure env-export clean cert cert-wait \
+        github-oidc github-oidc-verify \
         backend-push backend-deploy backend-url backend-redeploy backend-status \
         backend-logs backend-destroy
 
@@ -235,9 +236,23 @@ github-oidc: aws-check ## Create the IAM role GitHub Actions assumes (no stored 
 		echo "GITHUB_REPO is not set. Add it to .env, e.g. GITHUB_REPO=owner/repo"; \
 		exit 1; \
 	}
-	@create=yes; \
-	aws iam list-open-id-connect-providers --output text 2>/dev/null \
-		| grep -q "token.actions.githubusercontent.com" && create=no; \
+	@account=$$(aws sts get-caller-identity --query Account --output text); \
+	arn="arn:aws:iam::$$account:oidc-provider/token.actions.githubusercontent.com"; \
+	create=yes; \
+	if aws iam get-open-id-connect-provider --open-id-connect-provider-arn "$$arn" >/dev/null 2>&1; then \
+		create=no; \
+		echo "OIDC provider already exists — CloudFormation will not manage it."; \
+		if aws iam get-open-id-connect-provider --open-id-connect-provider-arn "$$arn" \
+			--query "ClientIDList" --output text | tr '\t' '\n' | grep -qx "sts.amazonaws.com"; then \
+			echo "  audience sts.amazonaws.com: present"; \
+		else \
+			echo "  audience sts.amazonaws.com: MISSING — adding it"; \
+			aws iam add-client-id-to-open-id-connect-provider \
+				--open-id-connect-provider-arn "$$arn" \
+				--client-id sts.amazonaws.com; \
+			echo "  added."; \
+		fi; \
+	fi; \
 	echo "Deploying $(OIDC_STACK) for $(GITHUB_REPO) (create provider: $$create)…"; \
 	aws cloudformation deploy \
 		--template-file infra/github-oidc.yaml \
@@ -249,19 +264,35 @@ github-oidc: aws-check ## Create the IAM role GitHub Actions assumes (no stored 
 			GitHubRepo=$(GITHUB_REPO) \
 			CreateOidcProvider=$$create \
 		|| { $(MAKE) --no-print-directory STACK_NAME=$(OIDC_STACK) explain-failure; exit 1; }
-	@arn=$$(aws cloudformation describe-stacks --stack-name $(OIDC_STACK) \
-		--query "Stacks[0].Outputs[?OutputKey=='RoleArn'].OutputValue" --output text); \
+	@$(MAKE) --no-print-directory github-oidc-verify
+
+github-oidc-verify: ## Check the provider audience and role trust are actually usable
+	@account=$$(aws sts get-caller-identity --query Account --output text); \
+	arn="arn:aws:iam::$$account:oidc-provider/token.actions.githubusercontent.com"; \
 	echo; \
-	echo "  Role created:"; \
-	echo "    $$arn"; \
+	echo "  Verifying what GitHub will actually be checked against:"; \
 	echo; \
-	echo "  Set it in GitHub as a repository VARIABLE (not a secret):"; \
-	echo "    Settings -> Secrets and variables -> Actions -> Variables -> New"; \
-	echo "    Name:  AWS_ROLE_ARN"; \
-	echo "    Value: $$arn"; \
+	aws iam get-open-id-connect-provider --open-id-connect-provider-arn "$$arn" \
+		--query "ClientIDList" --output text | tr '\t' '\n' | grep -qx "sts.amazonaws.com" \
+		&& echo "    audience sts.amazonaws.com .. OK" \
+		|| { echo "    audience sts.amazonaws.com .. MISSING"; exit 1; }; \
+	role="$(PROJECT_NAME)-github-deploy"; \
+	aws iam get-role --role-name "$$role" \
+		--query "Role.AssumeRolePolicyDocument.Statement[0].Principal.Federated" --output text \
+		| grep -q "token.actions.githubusercontent.com" \
+		&& echo "    role trusts the GitHub provider .. OK" \
+		|| { echo "    role trusts the GitHub provider .. NO"; exit 1; }; \
+	echo "    subject patterns the role accepts:"; \
+	aws iam get-role --role-name "$$role" \
+		--query "Role.AssumeRolePolicyDocument.Statement[0].Condition.StringLike.*" --output text \
+		| tr '\t' '\n' | sed 's/^/      /'; \
 	echo; \
-	echo "  Then delete any AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY secrets:"; \
-	echo "  the workflow no longer reads them."
+	echo "  A workflow subject must match one of those. GitHub sends the"; \
+	echo "  immutable form, repo:owner@<id>/name@<id>:..., on newer repositories."; \
+	echo; \
+	arn_out=$$(aws iam get-role --role-name "$$role" --query "Role.Arn" --output text); \
+	echo "  AWS_ROLE_ARN repository variable:"; \
+	echo "    $$arn_out"
 
 # --------------------------------------------------------------- certificate
 
