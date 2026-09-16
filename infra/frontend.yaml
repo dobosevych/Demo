@@ -1,0 +1,110 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Static hosting for the meetings frontend: a private S3 bucket holding the Vite
+  bundle, fronted by CloudFront. The bucket is never public; CloudFront reaches it
+  through an Origin Access Control, and the bucket policy trusts only this
+  distribution.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: meetings
+    Description: Prefix for resource names.
+    AllowedPattern: "[a-z0-9-]+"
+
+Resources:
+  SiteBucket:
+    Type: AWS::S3::Bucket
+    # Deliberately NOT DeletionPolicy: Retain. This bucket only ever holds the
+    # built bundle, which `make frontend-build` regenerates from source. Retaining
+    # it means a failed create leaves an orphan behind that collides with the next
+    # attempt — a trap, in exchange for protecting nothing irreplaceable.
+    Properties:
+      BucketName: !Sub "${ProjectName}-frontend-${AWS::AccountId}-${AWS::Region}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+
+  OriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${ProjectName}-frontend-oac"
+        Description: Lets this distribution, and only this distribution, read the bucket.
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub "${ProjectName} frontend"
+        DefaultRootObject: index.html
+        HttpVersion: http2and3
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: s3-site
+            DomainName: !GetAtt SiteBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt OriginAccessControl.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+        DefaultCacheBehavior:
+          TargetOriginId: s3-site
+          ViewerProtocolPolicy: redirect-to-https
+          Compress: true
+          AllowedMethods: [GET, HEAD, OPTIONS]
+          CachedMethods: [GET, HEAD]
+          # Managed-CachingOptimized. Hashed asset filenames make this safe; only
+          # index.html is re-uploaded with a no-cache header by `make frontend-deploy`.
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+        CustomErrorResponses:
+          # A single-page app: any unknown path is the app's own route, not a 404.
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 0
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 0
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+
+  SiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SiteBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudFrontRead
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub "${SiteBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}"
+
+Outputs:
+  BucketName:
+    Description: Bucket the bundle is synced into.
+    Value: !Ref SiteBucket
+  DistributionId:
+    Description: Distribution to invalidate after a sync.
+    Value: !Ref Distribution
+  SiteUrl:
+    Description: Public URL of the deployed frontend.
+    Value: !Sub "https://${Distribution.DomainName}"

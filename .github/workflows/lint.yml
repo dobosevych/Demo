@@ -1,0 +1,78 @@
+name: Lint
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A second push to the same branch cancels the first: nothing here needs to
+# finish once it is out of date.
+concurrency:
+  group: lint-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Backend (ruff)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ruff
+        run: pip install ruff==0.8.6
+
+      - name: Check
+        run: ruff check --output-format=github .
+
+      - name: Check formatting
+        run: ruff format --check .
+
+  frontend:
+    name: Frontend (TypeScript)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # No lockfile is committed, so this is `install`, not `ci`.
+      - name: Install dependencies
+        run: npm install
+
+      - name: Typecheck
+        run: npx tsc -b --pretty false
+
+      - name: Build
+        run: npm run build
+
+  infra:
+    name: CloudFormation (cfn-lint)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install cfn-lint
+        run: pip install cfn-lint==1.22.3
+
+      # W1011 asks for a Secrets Manager dynamic reference instead of a NoEcho
+      # parameter for DbPassword. That is the better pattern; this project takes
+      # the password from .env deliberately, so the rule is silenced knowingly.
+      - name: Lint templates
+        run: cfn-lint infra/*.yaml --ignore-checks W1011

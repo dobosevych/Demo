@@ -1,0 +1,362 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  The meetings backend on ECS Fargate: a VPC, an RDS PostgreSQL instance, a
+  Fargate service running the FastAPI image from ECR, and an Application Load
+  Balancer in front of it. Instance sizes are the smallest available, and the
+  database class is Free Tier eligible.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: meetings
+    AllowedPattern: "[a-z0-9-]+"
+  ImageUri:
+    Type: String
+    Description: ECR image URI, e.g. <account>.dkr.ecr.<region>.amazonaws.com/meetings-backend:latest
+  DbPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    MaxLength: 63
+    AllowedPattern: "[^/@\" ]+"
+    Description: Master password for the database. Comes from .env, never committed.
+  DbInstanceClass:
+    Type: String
+    Default: db.t4g.micro
+    Description: Free Tier covers 750 hours/month of db.t4g.micro for 12 months.
+  TaskCpu:
+    Type: String
+    Default: "256"
+    Description: Smallest Fargate size. 256 = 0.25 vCPU.
+  TaskMemory:
+    Type: String
+    Default: "512"
+    Description: Smallest memory allowed at 256 CPU.
+  CorsOrigins:
+    Type: String
+    Default: "*"
+    Description: Comma-separated origins the API accepts.
+  CertificateArn:
+    Type: String
+    Default: ""
+    Description: >
+      ACM certificate for the API's domain. Empty means HTTP only: an ALB cannot
+      serve HTTPS without a certificate, and a certificate needs a domain.
+  DomainName:
+    Type: String
+    Default: ""
+    Description: The domain the certificate covers, e.g. demo.example.com. Used for the ApiUrl output.
+
+Conditions:
+  HasCertificate: !Not [!Equals [!Ref CertificateArn, ""]]
+
+Resources:
+  # --- Network -------------------------------------------------------------
+  # Public subnets with an internet gateway, and tasks given a public IP. That
+  # is what lets them pull from ECR without a NAT gateway, which would cost far
+  # more than everything else here combined.
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.42.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-backend"
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  SubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.42.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+
+  SubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.42.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  SubnetARouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref SubnetA
+      RouteTableId: !Ref RouteTable
+
+  SubnetBRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref SubnetB
+      RouteTableId: !Ref RouteTable
+
+  # --- Security groups -----------------------------------------------------
+  LbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Load balancer. Open to the internet on HTTP.
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: Public HTTP
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: Public HTTPS
+
+  TaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Fargate tasks. Reachable only from the load balancer.
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8000
+          ToPort: 8000
+          SourceSecurityGroupId: !Ref LbSecurityGroup
+          Description: API port, from the load balancer only
+
+  DbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Database. Reachable only from the tasks.
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref TaskSecurityGroup
+          Description: Postgres, from the Fargate tasks only
+
+  # --- Database ------------------------------------------------------------
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: !Sub "${ProjectName} backend database"
+      SubnetIds:
+        - !Ref SubnetA
+        - !Ref SubnetB
+
+  Database:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      DBInstanceIdentifier: !Sub "${ProjectName}-backend-db"
+      Engine: postgres
+      EngineVersion: "16"
+      DBInstanceClass: !Ref DbInstanceClass
+      # 20 GB of gp2 is exactly what Free Tier covers.
+      AllocatedStorage: "20"
+      StorageType: gp2
+      StorageEncrypted: true
+      DBName: meetings
+      MasterUsername: meetings
+      MasterUserPassword: !Ref DbPassword
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VPCSecurityGroups:
+        - !GetAtt DbSecurityGroup.GroupId
+      PubliclyAccessible: false
+      MultiAZ: false
+      BackupRetentionPeriod: 1
+      DeletionProtection: false
+
+  # --- Load balancer -------------------------------------------------------
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${ProjectName}-backend-lb"
+      Type: application
+      Scheme: internet-facing
+      SecurityGroups:
+        - !Ref LbSecurityGroup
+      Subnets:
+        - !Ref SubnetA
+        - !Ref SubnetB
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${ProjectName}-backend-tg"
+      VpcId: !Ref Vpc
+      Port: 8000
+      Protocol: HTTP
+      TargetType: ip
+      # The same endpoint compose uses: it passes only once migrations have
+      # applied and the API is serving.
+      HealthCheckPath: /api/meetings
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 5
+      Matcher:
+        HttpCode: "200"
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "10"
+
+  # Port 80. With a certificate it only redirects; without one it is the API.
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - !If
+          - HasCertificate
+          - Type: redirect
+            RedirectConfig:
+              Protocol: HTTPS
+              Port: "443"
+              StatusCode: HTTP_301
+          - Type: forward
+            TargetGroupArn: !Ref TargetGroup
+
+  HttpsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: HasCertificate
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      Certificates:
+        - CertificateArn: !Ref CertificateArn
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  # --- ECS -----------------------------------------------------------------
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${ProjectName}-backend"
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${ProjectName}-backend"
+      RetentionInDays: 7
+
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${ProjectName}-backend"
+      RequiresCompatibilities:
+        - FARGATE
+      NetworkMode: awsvpc
+      Cpu: !Ref TaskCpu
+      Memory: !Ref TaskMemory
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      ContainerDefinitions:
+        - Name: api
+          Image: !Ref ImageUri
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8000
+              Protocol: tcp
+          Environment:
+            - Name: DATABASE_URL
+              Value: !Sub "postgresql+psycopg://meetings:${DbPassword}@${Database.Endpoint.Address}:${Database.Endpoint.Port}/meetings"
+            - Name: CORS_ORIGINS
+              Value: !Ref CorsOrigins
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: api
+
+  Service:
+    Type: AWS::ECS::Service
+    # Nothing can register as healthy before the listener exists.
+    DependsOn: Listener
+    Properties:
+      ServiceName: !Sub "${ProjectName}-backend"
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref TaskDefinition
+      LaunchType: FARGATE
+      DesiredCount: 1
+      # The container runs `alembic upgrade head` before uvicorn, so give it
+      # room to finish before health checks start counting.
+      HealthCheckGracePeriodSeconds: 120
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 0
+        MaximumPercent: 200
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          # Required to pull the image without a NAT gateway.
+          AssignPublicIp: ENABLED
+          Subnets:
+            - !Ref SubnetA
+            - !Ref SubnetB
+          SecurityGroups:
+            - !Ref TaskSecurityGroup
+      LoadBalancers:
+        - ContainerName: api
+          ContainerPort: 8000
+          TargetGroupArn: !Ref TargetGroup
+
+Outputs:
+  ApiUrl:
+    Description: Base URL of the API. Use this as VITE_API_URL for the frontend.
+    Value: !If
+      - HasCertificate
+      - !Sub "https://${DomainName}"
+      - !Sub "http://${LoadBalancer.DNSName}"
+  LoadBalancerDomain:
+    Description: The ALB's own hostname. Point your domain's CNAME at this.
+    Value: !GetAtt LoadBalancer.DNSName
+  ClusterName:
+    Value: !Ref Cluster
+  ServiceName:
+    Value: !GetAtt Service.Name
+  DbEndpoint:
+    Description: Database address. Reachable only from inside the VPC.
+    Value: !GetAtt Database.Endpoint.Address

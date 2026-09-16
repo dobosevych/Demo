@@ -1,0 +1,38 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "meetings-backend"
+version = "1.0.0"
+description = "FastAPI service for the meetings app"
+requires-python = "==3.12.*"
+dependencies = [
+    "fastapi==0.115.6",
+    "uvicorn[standard]==0.34.0",
+    "sqlalchemy==2.0.36",
+    "alembic==1.14.0",
+    "psycopg[binary]==3.2.3",
+    "pydantic==2.10.4",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = ["alembic/versions"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle
+    "F",    # pyflakes
+    "I",    # import sorting
+    "UP",   # pyupgrade
+    "B",    # bugbear
+    "SIM",  # simplify
+    "C4",   # comprehensions
+]
+# FastAPI's dependency injection is function calls in argument defaults.
+ignore = ["B008"]

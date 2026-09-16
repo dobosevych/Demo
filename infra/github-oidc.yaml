@@ -1,0 +1,177 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Lets GitHub Actions deploy this project without any stored credentials. It
+  registers GitHub's OIDC issuer as an identity provider and creates one role
+  that only workflows in a named repository can assume. Each run receives
+  short-lived credentials; nothing long-lived is ever put in the repository.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: meetings
+    AllowedPattern: "[a-z0-9-]+"
+  GitHubRepo:
+    Type: String
+    Description: The repository allowed to assume the role, as owner/name.
+    AllowedPattern: "[A-Za-z0-9._-]+/[A-Za-z0-9._-]+"
+  GitHubRef:
+    Type: String
+    Default: "*"
+    Description: >
+      Which refs may assume it. "*" is any branch, tag or environment.
+      Narrow it to e.g. "ref:refs/heads/main" once the workflow is proven.
+  CreateOidcProvider:
+    Type: String
+    Default: "yes"
+    AllowedValues: ["yes", "no"]
+    Description: >
+      An account can hold only one provider per issuer. Set to "no" if
+      token.actions.githubusercontent.com is already registered.
+
+Conditions:
+  ShouldCreateProvider: !Equals [!Ref CreateOidcProvider, "yes"]
+
+Resources:
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: ShouldCreateProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList:
+        - sts.amazonaws.com
+      # AWS verifies GitHub's certificate chain itself; this is kept only
+      # because older tooling expects the property to be present.
+      ThumbprintList:
+        - 6938fd4d98bab03faadb97b34396831e3780aea1
+
+  DeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-github-deploy"
+      Description: !Sub "Assumed by GitHub Actions in ${GitHubRepo}"
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com"
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                # Without this, any OIDC issuer audience could be replayed here.
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              StringLike:
+                # This is the line that limits the role to one repository.
+                token.actions.githubusercontent.com:sub: !Sub "repo:${GitHubRepo}:${GitHubRef}"
+      Policies:
+        - PolicyName: deploy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # The stacks this project owns, and nothing else.
+              - Sid: CloudFormationOnProjectStacks
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateStack
+                  - cloudformation:UpdateStack
+                  - cloudformation:DeleteStack
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:DescribeStackResource
+                  - cloudformation:DescribeStackResources
+                  - cloudformation:GetTemplateSummary
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:ListChangeSets
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:cloudformation:*:${AWS::AccountId}:stack/${ProjectName}-*/*"
+
+              - Sid: CloudFormationReadOnly
+                Effect: Allow
+                Action:
+                  - cloudformation:ValidateTemplate
+                  - cloudformation:ListStacks
+                Resource: "*"
+
+              # Pushing the image. The auth token call cannot be scoped.
+              - Sid: EcrLogin
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+
+              - Sid: EcrRepository
+                Effect: Allow
+                Action:
+                  - ecr:CreateRepository
+                  - ecr:DescribeRepositories
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:BatchGetImage
+                  - ecr:CompleteLayerUpload
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:InitiateLayerUpload
+                  - ecr:PutImage
+                  - ecr:UploadLayerPart
+                  - ecr:TagResource
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:ecr:*:${AWS::AccountId}:repository/${ProjectName}-*"
+
+              - Sid: EcrCreate
+                Effect: Allow
+                Action: ecr:CreateRepository
+                Resource: "*"
+
+              # The services the stacks build. These APIs create networking and
+              # managed resources whose ARNs do not exist until creation, so
+              # they cannot be scoped by resource in any useful way.
+              - Sid: Infrastructure
+                Effect: Allow
+                Action:
+                  - ecs:*
+                  - elasticloadbalancing:*
+                  - rds:*
+                  - ec2:*
+                  - logs:*
+                  - acm:*
+                  - s3:*
+                  - cloudfront:*
+                Resource: "*"
+
+              # Only the roles CloudFormation creates for this project, and
+              # only handing them to the services that run the tasks.
+              - Sid: ProjectRoles
+                Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:GetRole
+                  - iam:PassRole
+                  - iam:TagRole
+                  - iam:UntagRole
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:GetRolePolicy
+                  - iam:ListRolePolicies
+                  - iam:ListAttachedRolePolicies
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${ProjectName}-*"
+
+              - Sid: ServiceLinkedRoles
+                Effect: Allow
+                Action: iam:CreateServiceLinkedRole
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    iam:AWSServiceName:
+                      - ecs.amazonaws.com
+                      - elasticloadbalancing.amazonaws.com
+                      - rds.amazonaws.com
+
+Outputs:
+  RoleArn:
+    Description: Set this as the AWS_ROLE_ARN repository variable in GitHub.
+    Value: !GetAtt DeployRole.Arn

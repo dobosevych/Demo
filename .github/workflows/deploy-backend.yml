@@ -1,0 +1,99 @@
+name: Deploy backend
+
+on:
+  # Deploying costs money and changes a live system, so it never runs on a push
+  # by itself. Trigger it deliberately.
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: Type "deploy" to confirm
+        required: true
+        default: ""
+
+# Never let two deployments touch the same stack at once.
+concurrency:
+  group: deploy-backend
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write        # for OIDC, if AWS_ROLE_ARN is configured
+
+jobs:
+  deploy:
+    name: Build, push and deploy
+    runs-on: ubuntu-latest
+    environment: aws
+    steps:
+      - name: Check the confirmation
+        if: inputs.confirm != 'deploy'
+        run: |
+          echo "::error::Type 'deploy' in the confirm box to run this workflow."
+          exit 1
+
+      - name: Check the role is configured
+        if: vars.AWS_ROLE_ARN == ''
+        run: |
+          echo "::error::AWS_ROLE_ARN repository variable is not set."
+          echo "::error::Create the role with 'make github-oidc', then set the variable."
+          exit 1
+
+      - uses: actions/checkout@v4
+
+      # OIDC only. GitHub mints a short-lived token for this run, AWS exchanges
+      # it for temporary credentials, and they expire when the job ends. There
+      # is no access key in this repository to leak or rotate.
+      # The role is created by infra/github-oidc.yaml and trusts only this repo.
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ vars.AWS_REGION }}
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          role-session-name: deploy-backend-${{ github.run_id }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      # The same target the Makefile uses locally, so there is one deployment
+      # path rather than two that can drift apart.
+      - name: Deploy
+        env:
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          PROJECT_NAME: ${{ vars.PROJECT_NAME }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          CORS_ORIGINS: ${{ vars.CORS_ORIGINS }}
+          API_DOMAIN: ${{ vars.API_DOMAIN }}
+        run: make backend-deploy
+
+      - name: Wait for the service to stabilise
+        env:
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          PROJECT_NAME: ${{ vars.PROJECT_NAME }}
+        run: |
+          cluster=$(aws cloudformation describe-stacks \
+            --stack-name "${PROJECT_NAME}-backend" \
+            --query "Stacks[0].Outputs[?OutputKey=='ClusterName'].OutputValue" --output text)
+          service=$(aws cloudformation describe-stacks \
+            --stack-name "${PROJECT_NAME}-backend" \
+            --query "Stacks[0].Outputs[?OutputKey=='ServiceName'].OutputValue" --output text)
+          echo "Waiting for $service to reach a steady state…"
+          aws ecs wait services-stable --cluster "$cluster" --services "$service"
+
+      - name: Report the URL
+        env:
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          PROJECT_NAME: ${{ vars.PROJECT_NAME }}
+        run: |
+          url=$(aws cloudformation describe-stacks \
+            --stack-name "${PROJECT_NAME}-backend" \
+            --query "Stacks[0].Outputs[?OutputKey=='ApiUrl'].OutputValue" --output text)
+          echo "### Backend deployed" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`$url\`" >> "$GITHUB_STEP_SUMMARY"
+
+      # If anything above failed, print why rather than leaving a red X.
+      - name: Explain a failure
+        if: failure()
+        env:
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          PROJECT_NAME: ${{ vars.PROJECT_NAME }}
+        run: make STACK_NAME="${PROJECT_NAME}-backend" explain-failure || true

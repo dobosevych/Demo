@@ -1,0 +1,54 @@
+services:
+  postgres:
+    image: postgres:16.6-alpine
+    environment:
+      POSTGRES_USER: meetings
+      POSTGRES_PASSWORD: meetings
+      POSTGRES_DB: meetings
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      # The service is not healthy until Postgres answers for this database.
+      test: ["CMD-SHELL", "pg_isready -U meetings -d meetings"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  backend:
+    build: ./backend
+    environment:
+      DATABASE_URL: postgresql+psycopg://meetings:meetings@postgres:5432/meetings
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        # So the migration step never races the database's first boot.
+        condition: service_healthy
+    healthcheck:
+      # Succeeds only after migrations applied and the API is serving — exactly
+      # the condition the frontend needs.
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen("http://127.0.0.1:8000/api/meetings").read()
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
+
+  frontend:
+    build: ./frontend
+    environment:
+      # The browser makes this request, not the container, so it is the host port.
+      VITE_API_URL: http://localhost:8000
+    ports:
+      - "5173:5173"
+    depends_on:
+      backend:
+        condition: service_healthy
+
+volumes:
+  postgres-data:
