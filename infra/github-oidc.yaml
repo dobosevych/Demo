@@ -74,8 +74,24 @@ Resources:
                 # Without this, any OIDC issuer audience could be replayed here.
                 token.actions.githubusercontent.com:aud: sts.amazonaws.com
               StringLike:
-                # This is the line that limits the role to one repository.
-                token.actions.githubusercontent.com:sub: !Sub "repo:${GitHubRepo}:${GitHubRef}"
+                # The lines that limit the role to one repository. Two patterns,
+                # matched as OR, because GitHub issues the subject in either of
+                # two shapes and which one you get is not up to you:
+                #
+                #   classic:   repo:owner/name:environment:aws
+                #   immutable: repo:owner@1234/name@5678:environment:aws
+                #
+                # The immutable form embeds the numeric owner and repository IDs,
+                # so that a renamed or re-created repository cannot inherit the
+                # trust of the old one. Matching only the classic form fails with
+                # "Not authorized to perform sts:AssumeRoleWithWebIdentity", which
+                # says nothing about why.
+                token.actions.githubusercontent.com:sub:
+                  - !Sub "repo:${GitHubRepo}:${GitHubRef}"
+                  - !Sub
+                    - "repo:${Owner}@*/${Name}@*:${GitHubRef}"
+                    - Owner: !Select [0, !Split ["/", !Ref GitHubRepo]]
+                      Name: !Select [1, !Split ["/", !Ref GitHubRepo]]
       Policies:
         - PolicyName: deploy
           PolicyDocument:
