@@ -49,6 +49,9 @@ Resources:
       ThumbprintList:
         - 6938fd4d98bab03faadb97b34396831e3780aea1
         - 1c58a3a8518e8759bf075b76b750d4f2df264fcd
+      Tags:
+        - Key: PROJECT_NAME
+          Value: !Ref ProjectName
 
   DeployRole:
     Type: AWS::IAM::Role
@@ -56,6 +59,9 @@ Resources:
       RoleName: !Sub "${ProjectName}-github-deploy"
       Description: !Sub "Assumed by GitHub Actions in ${GitHubRepo}"
       MaxSessionDuration: 3600
+      Tags:
+        - Key: PROJECT_NAME
+          Value: !Ref ProjectName
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:

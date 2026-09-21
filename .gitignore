@@ -1,7 +1,5 @@
 # Credentials and anything derived from them. Never commit these.
 .env
-.env.sh
-.env.make
 .env.bak
 
 # Build output

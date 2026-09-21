@@ -12,17 +12,17 @@ SHELL := /bin/bash
 # Read .env if it is there, and export every name it defines so the aws CLI and
 # docker see them.
 #
-# .env is normalised first, into .env.make, because make does not strip quotes
-# and does not understand a shell `export` prefix: it would read
-# `export FOO='bar'` as the value `'bar'`, quotes and all. Accepting both the
-# plain and the shell form means a file written either way just works.
+# make reads a shell `export FOO=bar` line natively, but keeps quotes: it would
+# read `export FOO='bar'` as the value `'bar'`, quotes and all. So after the
+# include, each name .env defines has one pair of surrounding quotes stripped.
+# Accepting both the plain and the shell form means a file written either way
+# just works, and nothing is written next to .env.
 ifneq (,$(wildcard .env))
-_normalise := $(shell sed -E \
-	-e 's/^[[:space:]]*export[[:space:]]+//' \
-	-e "s/^([A-Za-z_][A-Za-z0-9_]*)='(.*)'[[:space:]]*$$/\1=\2/" \
-	-e 's/^([A-Za-z_][A-Za-z0-9_]*)="(.*)"[[:space:]]*$$/\1=\2/' \
-	.env > .env.make)
-include .env.make
+include .env
+_sp := $(subst ,, )
+unquote = $(subst __SP__,$(_sp),$(patsubst '%',%,$(patsubst "%",%,$(subst $(_sp),__SP__,$(1)))))
+_env_names := $(shell sed -nE 's/^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=.*/\2/p' .env)
+$(foreach v,$(_env_names),$(eval $(v) := $$(call unquote,$$(value $(v)))))
 export
 endif
 
@@ -45,10 +45,11 @@ ECR_REPO ?= $(PROJECT_NAME)-backend
 DIST := frontend/dist
 
 # Every stack is deployed with this tag, and CloudFormation copies stack tags onto
-# each resource it creates. The ECR repository, made outside CloudFormation, is
-# tagged explicitly. Activate the key under
+# each resource it creates. The templates also set PROJECT_NAME on every taggable
+# resource themselves, so it is there however a stack is deployed. The ECR
+# repository, made outside CloudFormation, is tagged explicitly. Activate the key under
 # Billing > Cost allocation tags to see this app's spend on its own.
-TAG_KEY ?= Project
+TAG_KEY ?= PROJECT_NAME
 TAG_VALUE ?= $(PROJECT_NAME)
 
 # Baked into the bundle at build time. Empty is deliberate and supported: the
@@ -74,7 +75,7 @@ BUNDLE_API_URL = $(if $(VITE_API_URL),$(VITE_API_URL),$(if $(API_ORIGIN),/))
 
 .PHONY: help aws-check frontend-build infra-deploy frontend-sync frontend-invalidate \
         frontend-deploy frontend-url frontend-status frontend-events frontend-destroy \
-        purge-failed-stack explain-failure env-export clean deploy \
+        purge-failed-stack explain-failure clean deploy \
         github-oidc github-oidc-verify \
         backend-push backend-deploy backend-url backend-redeploy backend-status \
         backend-logs backend-destroy
@@ -234,15 +235,6 @@ frontend-events: ## Show recent stack events, newest first (use this when a depl
 		--max-items 40 \
 		--query "StackEvents[].[Timestamp,ResourceStatus,LogicalResourceId,ResourceStatusReason]" \
 		--output table
-
-env-export: ## Write .env.sh, a safely quoted version of .env you can source
-	@sed -E -e "/^[[:space:]]*(\#|$$)/d" -e "s/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$$/export \1='\2'/" .env > .env.sh
-	@echo "Wrote .env.sh. Load it into your shell with:"
-	@echo
-	@echo "  source .env.sh"
-	@echo
-	@echo "Quoting it is why this file exists: 'source .env' breaks in zsh when a"
-	@echo "value contains ( ) < > or spaces, which .env leaves unquoted for make."
 
 github-oidc: aws-check ## Create the IAM role GitHub Actions assumes (no stored credentials)
 	@test -n "$(GITHUB_REPO)" || { \
@@ -443,6 +435,6 @@ frontend-destroy: aws-check ## Delete the stack and its bucket (requires CONFIRM
 	@echo "Delete requested. Watch it with:"
 	@echo "  aws cloudformation wait stack-delete-complete --stack-name $(STACK_NAME)"
 
-clean: ## Remove the local build output and generated env files
-	@rm -rf $(DIST) .env.make .env.sh
-	@echo "Removed $(DIST), .env.make and .env.sh"
+clean: ## Remove the local build output
+	@rm -rf $(DIST)
+	@echo "Removed $(DIST)"

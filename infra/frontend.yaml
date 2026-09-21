@@ -43,6 +43,9 @@ Resources:
       OwnershipControls:
         Rules:
           - ObjectOwnership: BucketOwnerEnforced
+      Tags:
+        - Key: PROJECT_NAME
+          Value: !Ref ProjectName
 
   OriginAccessControl:
     Type: AWS::CloudFront::OriginAccessControl
@@ -128,6 +131,9 @@ Resources:
           - !Ref AWS::NoValue
         ViewerCertificate:
           CloudFrontDefaultCertificate: true
+      Tags:
+        - Key: PROJECT_NAME
+          Value: !Ref ProjectName
 
   SiteBucketPolicy:
     Type: AWS::S3::BucketPolicy

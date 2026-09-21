@@ -26,10 +26,12 @@ Parameters:
     Description: Master password for the database. Comes from .env, never committed.
   DbEngineVersion:
     Type: String
-    Default: "16.6"
+    Default: "16.14"
     Description: >
       Aurora PostgreSQL version. Pausing at 0 ACU needs 13.15, 14.12, 15.7, 16.3
-      or later in each line.
+      or later in each line. AWS retires minor versions, so a pinned one
+      eventually fails with "Cannot find version"; list what a region offers with
+      aws rds describe-db-engine-versions --engine aurora-postgresql.
   DbMaxCapacity:
     Type: Number
     Default: 1
@@ -64,6 +66,8 @@ Resources:
       Tags:
         - Key: Name
           Value: !Sub "${ProjectName}-backend"
+        - Key: PROJECT_NAME
+          Value: !Ref ProjectName
 
   SubnetA:
     Type: AWS::EC2::Subnet
@@ -71,6 +75,9 @@ Resources:
       VpcId: !Ref Vpc
       CidrBlock: 10.42.1.0/24
       AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags:
+        - Key: PROJECT_NAME
+          Value: !Ref ProjectName
 
   SubnetB:
     Type: AWS::EC2::Subnet
@@ -78,6 +85,9 @@ Resources:
       VpcId: !Ref Vpc
       CidrBlock: 10.42.2.0/24
       AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags:
+        - Key: PROJECT_NAME
+          Value: !Ref ProjectName
 
   # --- Security groups -----------------------------------------------------
   FunctionSecurityGroup:
@@ -85,6 +95,9 @@ Resources:
     Properties:
       GroupDescription: The API function. Accepts nothing; only connects out to the database.
       VpcId: !Ref Vpc
+      Tags:
+        - Key: PROJECT_NAME
+          Value: !Ref ProjectName
 
   DbSecurityGroup:
     Type: AWS::EC2::SecurityGroup
@@ -97,6 +110,9 @@ Resources:
           ToPort: 5432
           SourceSecurityGroupId: !Ref FunctionSecurityGroup
           Description: Postgres, from the API function only
+      Tags:
+        - Key: PROJECT_NAME
+          Value: !Ref ProjectName
 
   # --- Database ------------------------------------------------------------
   DbSubnetGroup:
@@ -106,6 +122,9 @@ Resources:
       SubnetIds:
         - !Ref SubnetA
         - !Ref SubnetB
+      Tags:
+        - Key: PROJECT_NAME
+          Value: !Ref ProjectName
 
   DbCluster:
     Type: AWS::RDS::DBCluster
@@ -131,6 +150,9 @@ Resources:
       BackupRetentionPeriod: 1
       CopyTagsToSnapshot: true
       DeletionProtection: false
+      Tags:
+        - Key: PROJECT_NAME
+          Value: !Ref ProjectName
 
   DbInstance:
     Type: AWS::RDS::DBInstance
@@ -141,6 +163,9 @@ Resources:
       DBInstanceClass: db.serverless
       Engine: aurora-postgresql
       PubliclyAccessible: false
+      Tags:
+        - Key: PROJECT_NAME
+          Value: !Ref ProjectName
 
   # --- API -----------------------------------------------------------------
   LogGroup:
@@ -148,6 +173,9 @@ Resources:
     Properties:
       LogGroupName: !Sub "/aws/lambda/${ProjectName}-backend"
       RetentionInDays: 7
+      Tags:
+        - Key: PROJECT_NAME
+          Value: !Ref ProjectName
 
   FunctionRole:
     Type: AWS::IAM::Role
@@ -162,6 +190,9 @@ Resources:
       ManagedPolicyArns:
         # Logs, plus the network interfaces a function in a VPC needs.
         - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
+      Tags:
+        - Key: PROJECT_NAME
+          Value: !Ref ProjectName
 
   # The same image compose runs. The Lambda Web Adapter baked into it turns each
   # invocation into an HTTP request to uvicorn, so the app needs no Lambda code.
@@ -197,6 +228,9 @@ Resources:
           # outlast Lambda's 10-second init phase. This lets it finish inside
           # the first invocation instead of failing init.
           AWS_LWA_ASYNC_INIT: "true"
+      Tags:
+        - Key: PROJECT_NAME
+          Value: !Ref ProjectName
 
   FunctionUrl:
     Type: AWS::Lambda::Url

@@ -401,10 +401,10 @@ Everything the deployment needs comes from `.env` at the root, which the `Makefi
 exports. Copy `.env.example` to `.env` and fill it in. `.env` is in `.gitignore` and must never
 be committed.
 
-Either style of line works — `FOO=bar` or `export FOO='bar'`. The `Makefile` normalises the file
-into `.env.make` before including it, stripping any `export` prefix and surrounding quotes,
-because make itself does neither and would otherwise read `export FOO='bar'` as the value
-`'bar'`, quotes included.
+Either style of line works — `FOO=bar` or `export FOO='bar'`. The `Makefile` includes `.env`
+directly and then strips one pair of surrounding quotes from each value, because make itself
+would otherwise read `export FOO='bar'` as the value `'bar'`, quotes included. `.env` is the only
+env file: nothing is generated from it.
 
 | Variable                | Required | Meaning                                                    |
 | ----------------------- | -------- | ---------------------------------------------------------- |
@@ -453,7 +453,6 @@ attempt. `make frontend-destroy CONFIRM=yes` removes the stack and bucket togeth
 | `make explain-failure`       | Prints why the last stack operation failed, and what to do        |
 | `make purge-failed-stack`    | Clears a stack stuck in `ROLLBACK_COMPLETE`. Refuses any other state |
 | `make frontend-events`       | Prints recent stack events, newest first — read this when a deploy fails |
-| `make env-export`            | Prints the shell line that loads `.env` into your own terminal     |
 | `make frontend-destroy`      | Empties the bucket and deletes the stack. Needs `CONFIRM=yes`     |
 | `make clean`                 | Removes `frontend/dist`                                           |
 
