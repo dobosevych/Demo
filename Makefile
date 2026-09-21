@@ -59,13 +59,18 @@ TAG_VALUE ?= $(PROJECT_NAME)
 # site deploys and renders, and says it has no backend instead of blanking.
 VITE_API_URL ?=
 
+# $(shell) does not see variables exported from .env in GNU Make 3.81, the one
+# macOS ships, so the lookups below hand the AWS settings over explicitly.
+# Unset ones are left out, so credentials from the environment (CI) still work.
+aws_env = $(foreach v,AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_DEFAULT_REGION,$(if $($(v)),$(v)='$($(v))'))
+
 # Pull a stack output by name.
-stack_output = $(shell aws cloudformation describe-stacks \
+stack_output = $(shell $(aws_env) aws cloudformation describe-stacks \
 	--stack-name $(STACK_NAME) \
 	--query "Stacks[0].Outputs[?OutputKey=='$(1)'].OutputValue" \
 	--output text 2>/dev/null)
 
-backend_output = $(shell aws cloudformation describe-stacks \
+backend_output = $(shell $(aws_env) aws cloudformation describe-stacks \
 	--stack-name $(BACKEND_STACK) \
 	--query "Stacks[0].Outputs[?OutputKey=='$(1)'].OutputValue" \
 	--output text 2>/dev/null)
