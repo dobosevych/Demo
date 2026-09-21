@@ -37,6 +37,9 @@ TEMPLATE := infra/frontend.yaml
 BACKEND_TEMPLATE := infra/backend.yaml
 BACKEND_STACK ?= $(PROJECT_NAME)-backend
 
+# Custom hostname for the backend API, from .env. Empty deploys without one.
+API_DOMAIN ?=
+
 # GitHub repository allowed to deploy, as owner/name.
 GITHUB_REPO ?=
 OIDC_STACK ?= $(PROJECT_NAME)-github-oidc
@@ -78,7 +81,7 @@ BUNDLE_API_URL = $(if $(VITE_API_URL),$(VITE_API_URL),$(if $(API_ORIGIN),/))
         purge-failed-stack explain-failure clean deploy \
         github-oidc github-oidc-verify \
         backend-push backend-deploy backend-url backend-redeploy backend-status \
-        backend-logs backend-destroy
+        backend-logs backend-destroy backend-dns
 
 help: ## Show this help
 	@echo "Local development:"
@@ -363,6 +366,7 @@ backend-deploy: backend-push ## Deploy the database and the API, then print the 
 			ImageUri="$$image" \
 			DbPassword='$(DB_PASSWORD)' \
 			CorsOrigins='$(CORS_ORIGINS)' \
+			ApiDomainName='$(API_DOMAIN)' \
 		|| { $(MAKE) --no-print-directory STACK_NAME=$(BACKEND_STACK) explain-failure; exit 1; }
 	@$(MAKE) --no-print-directory backend-url
 
@@ -375,7 +379,42 @@ backend-url: ## Print the deployed API URL
 	echo "  The frontend reaches it same-origin, at /api on its CloudFront domain."; \
 	echo "  After the first backend deploy, wire that up with: make frontend-deploy"; \
 	echo; \
-	echo "  The first request after the database has paused takes ~20 seconds."
+	echo "  The first request after the database has paused takes ~20 seconds."; \
+	domain="$(call backend_output,ApiDomainUrl)"; \
+	if [ -n "$$domain" ] && [ "$$domain" != "None" ]; then \
+		echo; \
+		echo "  Custom domain: $$domain  (see: make backend-dns)"; \
+	fi
+
+backend-dns: ## Print the DNS records the API's custom domain needs
+	@test -n "$(API_DOMAIN)" || { echo "API_DOMAIN is empty; no custom domain configured."; exit 1; }
+	@cert=$$(aws cloudformation describe-stack-resource --stack-name $(BACKEND_STACK) \
+		--logical-resource-id ApiCertificate \
+		--query "StackResourceDetail.PhysicalResourceId" --output text 2>/dev/null); \
+	echo; \
+	echo "  Add these at the DNS provider for $(API_DOMAIN):"; \
+	echo; \
+	if [ -n "$$cert" ] && [ "$$cert" != "None" ]; then \
+		aws acm describe-certificate --certificate-arn "$$cert" \
+			--query "Certificate.[Status,DomainValidationOptions[0].ResourceRecord.Name,DomainValidationOptions[0].ResourceRecord.Value]" \
+			--output text | while read -r status name value; do \
+			echo "  1. Certificate validation ($$status)"; \
+			echo "     CNAME  $$name"; \
+			echo "        ->  $$value"; \
+		done; \
+	else \
+		echo "  1. Certificate not created yet. Run this again once backend-deploy has started it."; \
+	fi; \
+	target="$(call backend_output,ApiDomainTarget)"; \
+	echo; \
+	if [ -n "$$target" ] && [ "$$target" != "None" ]; then \
+		echo "  2. The API itself"; \
+		echo "     CNAME  $(API_DOMAIN)."; \
+		echo "        ->  $$target"; \
+	else \
+		echo "  2. The API's CNAME target exists once the certificate is issued and the deploy finishes."; \
+	fi; \
+	echo
 
 backend-redeploy: backend-push ## Push a new image and point the function at it
 	@fn="$(call backend_output,FunctionName)"; \

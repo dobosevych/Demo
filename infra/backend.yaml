@@ -51,6 +51,17 @@ Parameters:
       Comma-separated origins the API accepts. The frontend reaches it through
       its own CloudFront distribution, same-origin, so this only matters for
       calls made straight to the function URL.
+  ApiDomainName:
+    Type: String
+    Default: ""
+    Description: >
+      Custom hostname for the API, e.g. demo-api.dobosevych.com. Empty skips it.
+      Served by an API Gateway HTTP API (billed per request, nothing while idle)
+      with a regional ACM certificate. The DNS lives outside Route 53, so two
+      CNAMEs must be added by hand; `make backend-dns` prints them.
+
+Conditions:
+  HasApiDomain: !Not [!Equals [!Ref ApiDomainName, ""]]
 
 Resources:
   # --- Network -------------------------------------------------------------
@@ -255,6 +266,106 @@ Resources:
       Principal: "*"
       InvokedViaFunctionUrl: true
 
+  # --- Custom domain -------------------------------------------------------
+  # A function URL cannot carry a custom hostname, so the domain goes through an
+  # HTTP API in front of it. Its integration timeout is capped
+  # at 30 seconds, which still covers a cold start that wakes the database.
+  #
+  # The certificate stays PENDING_VALIDATION until its CNAME is in DNS, and the
+  # stack waits on it: on the first deploy, run `make backend-dns` in another
+  # terminal and add the records it prints.
+  ApiCertificate:
+    Type: AWS::CertificateManager::Certificate
+    Condition: HasApiDomain
+    Properties:
+      DomainName: !Ref ApiDomainName
+      ValidationMethod: DNS
+      Tags:
+        - Key: PROJECT_NAME
+          Value: !Ref ProjectName
+
+  # The app serves everything under /api (that is what CloudFront routes to it),
+  # but on its own domain the API lives at the root. So the HTTP API proxies to
+  # the function URL and puts the /api back: /meetings -> /api/meetings. The
+  # function URL is public already, so no extra invoke permission is needed,
+  # and API Gateway sends the function URL's own Host header, which it requires.
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Condition: HasApiDomain
+    Properties:
+      Name: !Sub "${ProjectName}-backend"
+      ProtocolType: HTTP
+      Tags:
+        PROJECT_NAME: !Ref ProjectName
+
+  HttpApiRootIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Condition: HasApiDomain
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: HTTP_PROXY
+      IntegrationMethod: ANY
+      IntegrationUri: !Sub "${FunctionUrl.FunctionUrl}api"
+      PayloadFormatVersion: "1.0"
+      TimeoutInMillis: 30000
+
+  HttpApiProxyIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Condition: HasApiDomain
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: HTTP_PROXY
+      IntegrationMethod: ANY
+      IntegrationUri: !Sub "${FunctionUrl.FunctionUrl}api/{proxy}"
+      PayloadFormatVersion: "1.0"
+      TimeoutInMillis: 30000
+
+  HttpApiRootRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: HasApiDomain
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "ANY /"
+      Target: !Sub "integrations/${HttpApiRootIntegration}"
+
+  HttpApiProxyRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: HasApiDomain
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "ANY /{proxy+}"
+      Target: !Sub "integrations/${HttpApiProxyIntegration}"
+
+  HttpApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Condition: HasApiDomain
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: $default
+      AutoDeploy: true
+      Tags:
+        PROJECT_NAME: !Ref ProjectName
+
+  ApiDomain:
+    Type: AWS::ApiGatewayV2::DomainName
+    Condition: HasApiDomain
+    Properties:
+      DomainName: !Ref ApiDomainName
+      DomainNameConfigurations:
+        - CertificateArn: !Ref ApiCertificate
+          EndpointType: REGIONAL
+          SecurityPolicy: TLS_1_2
+      Tags:
+        PROJECT_NAME: !Ref ProjectName
+
+  ApiDomainMapping:
+    Type: AWS::ApiGatewayV2::ApiMapping
+    Condition: HasApiDomain
+    Properties:
+      ApiId: !Ref HttpApi
+      DomainName: !Ref ApiDomain
+      Stage: !Ref HttpApiStage
+
 Outputs:
   ApiUrl:
     Description: >
@@ -271,3 +382,13 @@ Outputs:
   DbEndpoint:
     Description: Database address. Reachable only from inside the VPC.
     Value: !GetAtt DbCluster.Endpoint.Address
+  ApiDomainUrl:
+    Condition: HasApiDomain
+    Description: >
+      The API on its custom domain, once its CNAME is in DNS. Served at the
+      root: /meetings here is /api/meetings on the function.
+    Value: !Sub "https://${ApiDomainName}"
+  ApiDomainTarget:
+    Condition: HasApiDomain
+    Description: What the custom domain's CNAME must point to.
+    Value: !GetAtt ApiDomain.RegionalDomainName
