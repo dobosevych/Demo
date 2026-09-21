@@ -3,7 +3,8 @@ Description: >
   Static hosting for the meetings frontend: a private S3 bucket holding the Vite
   bundle, fronted by CloudFront. The bucket is never public; CloudFront reaches it
   through an Origin Access Control, and the bucket policy trusts only this
-  distribution.
+  distribution. When the backend is deployed, /api/* on the same distribution is
+  routed to its Lambda function URL, so the API is same-origin and HTTPS.
 
 Parameters:
   ProjectName:
@@ -11,6 +12,15 @@ Parameters:
     Default: meetings
     Description: Prefix for resource names.
     AllowedPattern: "[a-z0-9-]+"
+  ApiOriginDomain:
+    Type: String
+    Default: ""
+    Description: >
+      Hostname of the backend's function URL (the backend stack's
+      ApiOriginDomain output). Empty serves the site with no /api route.
+
+Conditions:
+  HasApi: !Not [!Equals [!Ref ApiOriginDomain, ""]]
 
 Resources:
   SiteBucket:
@@ -44,6 +54,27 @@ Resources:
         SigningBehavior: always
         SigningProtocol: sigv4
 
+  # A single-page app: a path with no file extension is one of the app's own
+  # routes, so it is served index.html. This replaces custom error responses,
+  # which would also rewrite the API's own 404s into the app's HTML.
+  SpaRouting:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: !Sub "${ProjectName}-frontend-spa-routing"
+      AutoPublish: true
+      FunctionConfig:
+        Comment: Serve index.html for app routes
+        Runtime: cloudfront-js-2.0
+      FunctionCode: |
+        function handler(event) {
+          var request = event.request;
+          var last = request.uri.split("/").pop();
+          if (last.indexOf(".") === -1) {
+            request.uri = "/index.html";
+          }
+          return request;
+        }
+
   Distribution:
     Type: AWS::CloudFront::Distribution
     Properties:
@@ -59,6 +90,16 @@ Resources:
             OriginAccessControlId: !GetAtt OriginAccessControl.Id
             S3OriginConfig:
               OriginAccessIdentity: ""
+          - !If
+            - HasApi
+            - Id: api
+              DomainName: !Ref ApiOriginDomain
+              CustomOriginConfig:
+                OriginProtocolPolicy: https-only
+                OriginSSLProtocols: [TLSv1.2]
+                # A cold start that also wakes a paused database takes ~20s.
+                OriginReadTimeout: 60
+            - !Ref AWS::NoValue
         DefaultCacheBehavior:
           TargetOriginId: s3-site
           ViewerProtocolPolicy: redirect-to-https
@@ -68,16 +109,23 @@ Resources:
           # Managed-CachingOptimized. Hashed asset filenames make this safe; only
           # index.html is re-uploaded with a no-cache header by `make frontend-deploy`.
           CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
-        CustomErrorResponses:
-          # A single-page app: any unknown path is the app's own route, not a 404.
-          - ErrorCode: 403
-            ResponseCode: 200
-            ResponsePagePath: /index.html
-            ErrorCachingMinTTL: 0
-          - ErrorCode: 404
-            ResponseCode: 200
-            ResponsePagePath: /index.html
-            ErrorCachingMinTTL: 0
+          FunctionAssociations:
+            - EventType: viewer-request
+              FunctionARN: !GetAtt SpaRouting.FunctionARN
+        CacheBehaviors: !If
+          - HasApi
+          - - PathPattern: /api/*
+              TargetOriginId: api
+              ViewerProtocolPolicy: https-only
+              Compress: true
+              AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+              CachedMethods: [GET, HEAD]
+              # Managed-CachingDisabled: every API call reaches the function.
+              CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+              # Managed-AllViewerExceptHostHeader: a function URL only answers to
+              # its own hostname, so the viewer's Host must not be forwarded.
+              OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+          - !Ref AWS::NoValue
         ViewerCertificate:
           CloudFrontDefaultCertificate: true
 

@@ -4,10 +4,15 @@ from collections.abc import Iterator
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.pool import NullPool
 
 from app.config import settings
 
-engine = create_engine(settings.database_url, pool_pre_ping=True)
+engine = (
+    create_engine(settings.database_url, pool_pre_ping=True)
+    if settings.db_keep_connections
+    else create_engine(settings.database_url, poolclass=NullPool)
+)
 
 SessionLocal = sessionmaker(
     bind=engine,

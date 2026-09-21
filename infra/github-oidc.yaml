@@ -114,6 +114,9 @@ Resources:
                   - cloudformation:ExecuteChangeSet
                   - cloudformation:DeleteChangeSet
                   - cloudformation:ListChangeSets
+                  # Stacks are deployed with tags, which needs these.
+                  - cloudformation:TagResource
+                  - cloudformation:UntagResource
                 Resource:
                   - !Sub "arn:${AWS::Partition}:cloudformation:*:${AWS::AccountId}:stack/${ProjectName}-*/*"
 
@@ -135,6 +138,7 @@ Resources:
                 Action:
                   - ecr:CreateRepository
                   - ecr:DescribeRepositories
+                  - ecr:DescribeImages
                   - ecr:BatchCheckLayerAvailability
                   - ecr:BatchGetImage
                   - ecr:CompleteLayerUpload
@@ -143,6 +147,10 @@ Resources:
                   - ecr:PutImage
                   - ecr:UploadLayerPart
                   - ecr:TagResource
+                  # Lambda grants itself pull access on the repository through
+                  # the caller when the function is created or updated.
+                  - ecr:GetRepositoryPolicy
+                  - ecr:SetRepositoryPolicy
                 Resource:
                   - !Sub "arn:${AWS::Partition}:ecr:*:${AWS::AccountId}:repository/${ProjectName}-*"
 
@@ -157,12 +165,10 @@ Resources:
               - Sid: Infrastructure
                 Effect: Allow
                 Action:
-                  - ecs:*
-                  - elasticloadbalancing:*
+                  - lambda:*
                   - rds:*
                   - ec2:*
                   - logs:*
-                  - acm:*
                   - s3:*
                   - cloudfront:*
                 Resource: "*"
@@ -195,8 +201,6 @@ Resources:
                 Condition:
                   StringEquals:
                     iam:AWSServiceName:
-                      - ecs.amazonaws.com
-                      - elasticloadbalancing.amazonaws.com
                       - rds.amazonaws.com
 
 Outputs:

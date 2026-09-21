@@ -69,7 +69,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install cfn-lint
-        run: pip install cfn-lint==1.22.3
+        run: pip install cfn-lint==1.57.0
 
       # W1011 asks for a Secrets Manager dynamic reference instead of a NoEcho
       # parameter for DbPassword. That is the better pattern; this project takes

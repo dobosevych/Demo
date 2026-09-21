@@ -37,16 +37,19 @@ TEMPLATE := infra/frontend.yaml
 BACKEND_TEMPLATE := infra/backend.yaml
 BACKEND_STACK ?= $(PROJECT_NAME)-backend
 
-# Domain for the API. Empty means the load balancer answers on HTTP only.
-API_DOMAIN ?=
 # GitHub repository allowed to deploy, as owner/name.
 GITHUB_REPO ?=
 OIDC_STACK ?= $(PROJECT_NAME)-github-oidc
 
-# The registrable zone, derived from API_DOMAIN: demo.example.com -> example.com
-DOMAIN_ZONE = $(shell echo '$(API_DOMAIN)' | cut -d. -f2-)
 ECR_REPO ?= $(PROJECT_NAME)-backend
 DIST := frontend/dist
+
+# Every stack is deployed with this tag, and CloudFormation copies stack tags onto
+# each resource it creates. The ECR repository, made outside CloudFormation, is
+# tagged explicitly. Activate the key under
+# Billing > Cost allocation tags to see this app's spend on its own.
+TAG_KEY ?= Project
+TAG_VALUE ?= $(PROJECT_NAME)
 
 # Baked into the bundle at build time. Empty is deliberate and supported: the
 # site deploys and renders, and says it has no backend instead of blanking.
@@ -63,9 +66,15 @@ backend_output = $(shell aws cloudformation describe-stacks \
 	--query "Stacks[0].Outputs[?OutputKey=='$(1)'].OutputValue" \
 	--output text 2>/dev/null)
 
+# The backend's function URL host, or empty when no backend is deployed. When it
+# is set, the distribution routes /api/* to it and the bundle calls the API
+# same-origin ("/"), unless VITE_API_URL in .env says otherwise.
+API_ORIGIN = $(filter-out None,$(call backend_output,ApiOriginDomain))
+BUNDLE_API_URL = $(if $(VITE_API_URL),$(VITE_API_URL),$(if $(API_ORIGIN),/))
+
 .PHONY: help aws-check frontend-build infra-deploy frontend-sync frontend-invalidate \
         frontend-deploy frontend-url frontend-status frontend-events frontend-destroy \
-        purge-failed-stack explain-failure env-export clean cert cert-wait \
+        purge-failed-stack explain-failure env-export clean deploy \
         github-oidc github-oidc-verify \
         backend-push backend-deploy backend-url backend-redeploy backend-status \
         backend-logs backend-destroy
@@ -79,7 +88,9 @@ help: ## Show this help
 		| awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
 	@echo
 	@echo "Variables:  STACK_NAME=$(STACK_NAME)  AWS_REGION=$(AWS_REGION)"
-	@echo "            VITE_API_URL=$(if $(VITE_API_URL),$(VITE_API_URL),<empty: deploys without a backend>)"
+	@echo "            VITE_API_URL=$(if $(VITE_API_URL),$(VITE_API_URL),<empty: same-origin /api once the backend is deployed>)"
+
+deploy: backend-deploy frontend-deploy ## Deploy everything: backend, then the frontend wired to it
 
 # ------------------------------------------------------------------ preflight
 
@@ -104,10 +115,11 @@ aws-check: ## Verify credentials reach AWS (from .env locally, or the environmen
 # ---------------------------------------------------------------------- build
 
 frontend-build: ## Build the static bundle into frontend/dist
-	@echo "Building the bundle (VITE_API_URL=$(if $(VITE_API_URL),$(VITE_API_URL),<empty>))…"
-	@docker build \
+	@api='$(BUNDLE_API_URL)'; \
+	echo "Building the bundle (VITE_API_URL=$${api:-<empty: no backend>})…"; \
+	docker build \
 		--target build \
-		--build-arg VITE_API_URL=$(VITE_API_URL) \
+		--build-arg VITE_API_URL="$$api" \
 		-t $(PROJECT_NAME)-frontend-build \
 		./frontend
 	@rm -rf $(DIST)
@@ -130,7 +142,8 @@ infra-deploy: aws-check ## Create or update the S3 + CloudFront stack
 	@aws cloudformation deploy \
 		--template-file $(TEMPLATE) \
 		--stack-name $(STACK_NAME) \
-		--parameter-overrides ProjectName=$(PROJECT_NAME) \
+		--parameter-overrides ProjectName=$(PROJECT_NAME) ApiOriginDomain=$(API_ORIGIN) \
+		--tags $(TAG_KEY)=$(TAG_VALUE) \
 		--no-fail-on-empty-changeset \
 		|| { $(MAKE) --no-print-directory explain-failure; exit 1; }
 	@echo "Bucket:       $(call stack_output,BucketName)"
@@ -268,6 +281,7 @@ github-oidc: aws-check ## Create the IAM role GitHub Actions assumes (no stored 
 		--template-file infra/github-oidc.yaml \
 		--stack-name $(OIDC_STACK) \
 		--capabilities CAPABILITY_NAMED_IAM \
+		--tags $(TAG_KEY)=$(TAG_VALUE) \
 		--no-fail-on-empty-changeset \
 		--parameter-overrides \
 			ProjectName=$(PROJECT_NAME) \
@@ -304,63 +318,10 @@ github-oidc-verify: ## Check the provider audience and role trust are actually u
 	echo "  AWS_ROLE_ARN repository variable:"; \
 	echo "    $$arn_out"
 
-# --------------------------------------------------------------- certificate
-
-cert: aws-check ## Request the HTTPS certificate for API_DOMAIN and show the DNS record to add
-	@test -n "$(API_DOMAIN)" || { \
-		echo "API_DOMAIN is not set in .env. Add e.g. API_DOMAIN=demo.example.com"; \
-		exit 1; \
-	}
-	@arn=$$(aws acm list-certificates \
-		--query "CertificateSummaryList[?DomainName=='$(API_DOMAIN)'].CertificateArn | [0]" \
-		--output text); \
-	if [ -z "$$arn" ] || [ "$$arn" = "None" ]; then \
-		echo "Requesting a certificate for $(API_DOMAIN)…"; \
-		arn=$$(aws acm request-certificate --domain-name $(API_DOMAIN) \
-			--validation-method DNS --query CertificateArn --output text); \
-		echo "Waiting for the validation record to be issued…"; \
-		for i in 1 2 3 4 5 6; do \
-			name=$$(aws acm describe-certificate --certificate-arn "$$arn" \
-				--query "Certificate.DomainValidationOptions[0].ResourceRecord.Name" --output text 2>/dev/null); \
-			[ -n "$$name" ] && [ "$$name" != "None" ] && break; \
-			sleep 5; \
-		done; \
-	fi; \
-	status=$$(aws acm describe-certificate --certificate-arn "$$arn" --query "Certificate.Status" --output text); \
-	echo; \
-	echo "  Certificate: $$arn"; \
-	echo "  Status:      $$status"; \
-	if [ "$$status" = "ISSUED" ]; then \
-		echo; \
-		echo "  Validated. Deploy with: make backend-deploy"; \
-	else \
-		name=$$(aws acm describe-certificate --certificate-arn "$$arn" \
-			--query "Certificate.DomainValidationOptions[0].ResourceRecord.Name" --output text); \
-		value=$$(aws acm describe-certificate --certificate-arn "$$arn" \
-			--query "Certificate.DomainValidationOptions[0].ResourceRecord.Value" --output text); \
-		host=$$(echo "$$name" | sed -e "s/\.$$//" -e "s/\.$(DOMAIN_ZONE)$$//"); \
-		echo; \
-		echo "  ---- Add this CNAME at your DNS provider, then run: make cert-wait ----"; \
-		echo; \
-		echo "    Type:      CNAME"; \
-		echo "    Full name: $$name"; \
-		echo "    Host/name: $$host      <- most panels want only this part"; \
-		echo "    Value:     $$value"; \
-		echo; \
-		echo "  The trailing dot is not typed. AWS checks this record to prove you"; \
-		echo "  own the domain; it must stay in place for the certificate's life."; \
-	fi
-
-cert-wait: ## Block until the certificate is validated and issued
-	@arn=$$(aws acm list-certificates \
-		--query "CertificateSummaryList[?DomainName=='$(API_DOMAIN)'].CertificateArn | [0]" \
-		--output text); \
-	test -n "$$arn" -a "$$arn" != "None" || { echo "No certificate for $(API_DOMAIN). Run: make cert"; exit 1; }; \
-	echo "Waiting for $(API_DOMAIN) to validate (DNS can take a few minutes)…"; \
-	aws acm wait certificate-validated --certificate-arn "$$arn" \
-		&& echo "Issued. Now run: make backend-deploy"
-
 # -------------------------------------------------------------------- backend
+
+# The image as pushed, pinned by digest so a new push is a change the stack sees.
+image_by_digest = $$(aws sts get-caller-identity --query Account --output text).dkr.ecr.$(AWS_DEFAULT_REGION).amazonaws.com/$(ECR_REPO)@$$(aws ecr describe-images --repository-name $(ECR_REPO) --image-ids imageTag=latest --query "imageDetails[0].imageDigest" --output text)
 
 backend-push: aws-check ## Build the backend image and push it to ECR
 	@account=$$(aws sts get-caller-identity --query Account --output text); \
@@ -370,13 +331,19 @@ backend-push: aws-check ## Build the backend image and push it to ECR
 		|| { echo "Creating ECR repository $(ECR_REPO)…"; \
 		     aws ecr create-repository --repository-name $(ECR_REPO) \
 		       --image-scanning-configuration scanOnPush=true >/dev/null; }; \
+	aws ecr tag-resource \
+		--resource-arn "arn:aws:ecr:$(AWS_DEFAULT_REGION):$$account:repository/$(ECR_REPO)" \
+		--tags Key=$(TAG_KEY),Value=$(TAG_VALUE); \
 	echo "Logging in to $$registry…"; \
 	aws ecr get-login-password | docker login --username AWS --password-stdin "$$registry"; \
 	echo "Building $$image…"; \
-	docker build --platform linux/amd64 -t "$$image" ./backend; \
+	docker build --platform linux/amd64 --provenance=false -t "$$image" ./backend; \
 	echo "Pushing…"; \
 	docker push "$$image"; \
 	echo "Pushed $$image"
+
+# --provenance=false above is required: Lambda rejects the multi-manifest image
+# index that buildx produces when it attaches provenance attestations.
 
 backend-deploy: backend-push ## Deploy the database and the API, then print the URL
 	@test -n "$(DB_PASSWORD)" || { \
@@ -390,33 +357,20 @@ backend-deploy: backend-push ## Deploy the database and the API, then print the 
 		aws cloudformation delete-stack --stack-name $(BACKEND_STACK); \
 		aws cloudformation wait stack-delete-complete --stack-name $(BACKEND_STACK); \
 	fi
-	@account=$$(aws sts get-caller-identity --query Account --output text); \
-	image="$$account.dkr.ecr.$(AWS_DEFAULT_REGION).amazonaws.com/$(ECR_REPO):latest"; \
-	cert=""; \
-	if [ -n "$(API_DOMAIN)" ]; then \
-		cert=$$(aws acm list-certificates --certificate-statuses ISSUED \
-			--query "CertificateSummaryList[?DomainName=='$(API_DOMAIN)'].CertificateArn | [0]" \
-			--output text); \
-		if [ -z "$$cert" ] || [ "$$cert" = "None" ]; then \
-			echo "API_DOMAIN is $(API_DOMAIN) but no ISSUED certificate exists for it."; \
-			echo "Run 'make cert', add the DNS record, then 'make cert-wait'."; \
-			exit 1; \
-		fi; \
-		echo "Using certificate $$cert"; \
-	fi; \
-	echo "Deploying stack $(BACKEND_STACK) — RDS and the load balancer take ~10 minutes…"; \
+	@image="$(image_by_digest)"; \
+	echo "Deploying stack $(BACKEND_STACK) with $$image"; \
+	echo "Creating the Aurora cluster takes ~10 minutes the first time…"; \
 	aws cloudformation deploy \
 		--template-file $(BACKEND_TEMPLATE) \
 		--stack-name $(BACKEND_STACK) \
 		--capabilities CAPABILITY_IAM \
+		--tags $(TAG_KEY)=$(TAG_VALUE) \
 		--no-fail-on-empty-changeset \
 		--parameter-overrides \
 			ProjectName=$(PROJECT_NAME) \
 			ImageUri="$$image" \
 			DbPassword='$(DB_PASSWORD)' \
 			CorsOrigins='$(CORS_ORIGINS)' \
-			DomainName='$(API_DOMAIN)' \
-			CertificateArn="$$cert" \
 		|| { $(MAKE) --no-print-directory STACK_NAME=$(BACKEND_STACK) explain-failure; exit 1; }
 	@$(MAKE) --no-print-directory backend-url
 
@@ -424,38 +378,42 @@ backend-url: ## Print the deployed API URL
 	@url="$(call backend_output,ApiUrl)"; \
 	test -n "$$url" -a "$$url" != "None" || { echo "Stack $(BACKEND_STACK) is not deployed."; exit 1; }; \
 	echo; \
-	echo "  $$url"; \
+	echo "  Function URL: $$url"; \
 	echo; \
-	if [ -n "$(API_DOMAIN)" ]; then \
-		lb="$(call backend_output,LoadBalancerDomain)"; \
-		echo "  For that URL to resolve, this CNAME must exist at your DNS provider:"; \
-		echo "    Host:  $$(echo $(API_DOMAIN) | cut -d. -f1)"; \
-		echo "    Value: $$lb"; \
-		echo; \
-	fi; \
-	echo "  Point the frontend at it by setting this in .env, then redeploying:"; \
-	echo "    VITE_API_URL=$$url"; \
-	echo "    make frontend-deploy"
+	echo "  The frontend reaches it same-origin, at /api on its CloudFront domain."; \
+	echo "  After the first backend deploy, wire that up with: make frontend-deploy"; \
+	echo; \
+	echo "  The first request after the database has paused takes ~20 seconds."
 
-backend-redeploy: backend-push ## Push a new image and roll the running service onto it
-	@cluster="$(call backend_output,ClusterName)"; \
-	service="$(call backend_output,ServiceName)"; \
-	test -n "$$cluster" -a "$$cluster" != "None" || { echo "Stack $(BACKEND_STACK) is not deployed."; exit 1; }; \
-	echo "Rolling $$service onto the new image…"; \
-	aws ecs update-service --cluster "$$cluster" --service "$$service" \
-		--force-new-deployment --query "service.deployments[0].status" --output text; \
-	echo "Watch it finish with: make backend-status"
+backend-redeploy: backend-push ## Push a new image and point the function at it
+	@fn="$(call backend_output,FunctionName)"; \
+	test -n "$$fn" -a "$$fn" != "None" || { echo "Stack $(BACKEND_STACK) is not deployed."; exit 1; }; \
+	image="$(image_by_digest)"; \
+	echo "Updating $$fn to $$image…"; \
+	aws lambda update-function-code --function-name "$$fn" --image-uri "$$image" \
+		--query "LastUpdateStatus" --output text; \
+	aws lambda wait function-updated-v2 --function-name "$$fn" && echo "Done."; \
+	echo "The stack still names the previous digest; the next 'make backend-deploy' reconciles it."
 
-backend-status: ## Show the running task count and deployment state
-	@cluster="$(call backend_output,ClusterName)"; \
-	service="$(call backend_output,ServiceName)"; \
-	test -n "$$cluster" -a "$$cluster" != "None" || { echo "Stack $(BACKEND_STACK) is not deployed."; exit 1; }; \
-	aws ecs describe-services --cluster "$$cluster" --services "$$service" \
-		--query "services[0].[status,desiredCount,runningCount,pendingCount]" --output table
+backend-status: ## Show the function's state and whether the database is running or paused
+	@fn="$(call backend_output,FunctionName)"; \
+	db="$(call backend_output,DbClusterId)"; \
+	test -n "$$fn" -a "$$fn" != "None" || { echo "Stack $(BACKEND_STACK) is not deployed."; exit 1; }; \
+	aws lambda get-function-configuration --function-name "$$fn" \
+		--query "[FunctionName,State,LastUpdateStatus,LastModified]" --output table; \
+	aws rds describe-db-clusters --db-cluster-identifier "$$db" \
+		--query "DBClusters[0].[DBClusterIdentifier,Status,ServerlessV2ScalingConfiguration.MinCapacity,ServerlessV2ScalingConfiguration.MaxCapacity]" \
+		--output table; \
+	acu=$$(aws cloudwatch get-metric-statistics --namespace AWS/RDS \
+		--metric-name ServerlessDatabaseCapacity --dimensions Name=DBClusterIdentifier,Value="$$db" \
+		--start-time "$$(date -u -v-10M +%Y-%m-%dT%H:%M:%S 2>/dev/null || date -u -d '10 minutes ago' +%Y-%m-%dT%H:%M:%S)" \
+		--end-time "$$(date -u +%Y-%m-%dT%H:%M:%S)" --period 60 --statistics Maximum \
+		--query "sort_by(Datapoints,&Timestamp)[-1].Maximum" --output text); \
+	echo "Database capacity in the last minutes: $$acu ACU (0 means paused)"
 
 backend-logs: ## Tail the API's application logs
-	@aws logs tail "/aws/apprunner/$(PROJECT_NAME)-backend" --follow --since 10m \
-		|| echo "No log group yet. The service has to start once first."
+	@aws logs tail "/aws/lambda/$(PROJECT_NAME)-backend" --follow --since 10m \
+		|| echo "No log group yet. The function has to run once first."
 
 backend-destroy: aws-check ## Delete the API, the database and the VPC (requires CONFIRM=yes)
 	@test "$(CONFIRM)" = "yes" || { \

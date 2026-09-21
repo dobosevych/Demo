@@ -3,7 +3,10 @@
  * shapes. Components call these functions; they never call `fetch` themselves.
  */
 
-const BASE_URL = (import.meta.env.VITE_API_URL ?? "").replace(/\/+$/, "");
+const RAW_URL: string = import.meta.env.VITE_API_URL ?? "";
+
+/** `"/"` means same-origin: the API is served at `/api` on the site's own domain. */
+const BASE_URL = RAW_URL.replace(/\/+$/, "");
 
 /**
  * Whether this build was given a backend to talk to.
@@ -12,7 +15,7 @@ const BASE_URL = (import.meta.env.VITE_API_URL ?? "").replace(/\/+$/, "");
  * `VITE_API_URL`. The page must still render, so this is a flag the UI reads
  * rather than a throw at import time — a throw here blanks the whole app.
  */
-export const apiConfigured = BASE_URL !== "";
+export const apiConfigured = RAW_URL !== "";
 
 /** One person. Shared by every meeting they attend; `email` is globally unique. */
 export interface Participant {

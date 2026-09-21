@@ -13,6 +13,11 @@ COPY alembic.ini ./
 
 RUN pip install --no-cache-dir .
 
+# Lets this same image run on Lambda: the adapter is a Lambda extension that
+# relays each invocation to uvicorn as HTTP. Outside Lambda it never starts, so
+# compose runs the image exactly as before.
+COPY --from=public.ecr.aws/awsguru/aws-lambda-adapter:0.9.1 /lambda-adapter /opt/extensions/lambda-adapter
+
 EXPOSE 8000
 
 # Migrations first, then the API: the schema is never behind the code that serves it.

@@ -11,6 +11,9 @@ from dataclasses import dataclass
 class Settings:
     database_url: str
     cors_origins: tuple[str, ...]
+    # False on Lambda: a pooled connection held open by a frozen function keeps
+    # Aurora Serverless from pausing, so each request connects and disconnects.
+    db_keep_connections: bool
 
 
 def _load() -> Settings:
@@ -22,7 +25,8 @@ def _load() -> Settings:
         )
     raw_origins = os.environ.get("CORS_ORIGINS", "http://localhost:5173")
     origins = tuple(origin.strip() for origin in raw_origins.split(",") if origin.strip())
-    return Settings(database_url=database_url, cors_origins=origins)
+    keep = os.environ.get("DB_KEEP_CONNECTIONS", "true").strip().lower() != "false"
+    return Settings(database_url=database_url, cors_origins=origins, db_keep_connections=keep)
 
 
 settings = _load()

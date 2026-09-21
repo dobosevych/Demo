@@ -387,12 +387,13 @@ to AWS as two independent stacks:
 | Stack                      | Template              | What it runs                                  |
 | -------------------------- | --------------------- | --------------------------------------------- |
 | `<PROJECT_NAME>-frontend`  | `infra/frontend.yaml` | S3 bucket + CloudFront distribution            |
-| `<PROJECT_NAME>-backend`   | `infra/backend.yaml`  | VPC + RDS PostgreSQL + ECS Fargate + load balancer |
+| `<PROJECT_NAME>-backend`   | `infra/backend.yaml`  | Lambda + Aurora Serverless v2 PostgreSQL in a private VPC |
 
-They are deliberately independent. The frontend is built with `VITE_API_URL`, so it can be
-deployed before the backend exists: with that variable empty the site loads, renders and
-explains that it has no backend, instead of failing to boot. Pointing it at an API later is a
-rebuild, not a code change.
+They are deliberately independent. The frontend can be deployed before the backend exists: with
+no backend the site loads, renders and explains that it has no backend, instead of failing to
+boot. Once the backend is deployed, `make frontend-deploy` routes `/api/*` on the frontend's
+CloudFront distribution to it and builds the bundle with `VITE_API_URL=/`, so the browser calls
+the API same-origin over HTTPS. `make deploy` does both, in that order.
 
 ### Credentials
 
@@ -412,7 +413,7 @@ because make itself does neither and would otherwise read `export FOO='bar'` as 
 | `AWS_SESSION_TOKEN`     | no       | Only for temporary STS or SSO credentials                   |
 | `AWS_REGION`            | no       | Defaults to `us-east-1`. Where the bucket and stack live    |
 | `PROJECT_NAME`          | no       | Defaults to `meetings`. Prefixes every resource name        |
-| `VITE_API_URL`          | no       | Empty deploys the frontend without a backend                |
+| `VITE_API_URL`          | no       | Leave empty: same-origin `/api` once the backend exists     |
 
 ### `infra/frontend.yaml`
 
@@ -422,8 +423,12 @@ One CloudFormation stack, named `<PROJECT_NAME>-frontend`:
   blocked. It is never a website endpoint and is never readable from the internet.
 - **Origin Access Control** — the only identity allowed to read the bucket.
 - **CloudFront distribution** — HTTPS only (`redirect-to-https`), compressed, `index.html` as
-  the default root object. `403` and `404` both return `/index.html` with status `200`, because
-  every unknown path belongs to the single-page app, not to S3.
+  the default root object. A small CloudFront Function serves `/index.html` for any path without
+  a file extension, because those belong to the single-page app, not to S3. (Custom error
+  responses would do the same but also rewrite the API's own `404`s into HTML.)
+- **`/api/*` behavior** — only when the backend is deployed (`ApiOriginDomain` parameter, taken
+  from the backend stack by `make infra-deploy`). Forwards to the Lambda function URL uncached,
+  with a 60-second origin timeout to cover a cold start that also wakes the database.
 - **Bucket policy** — grants `s3:GetObject` to the CloudFront service principal, conditioned on
   this distribution's ARN. No other distribution, and no anonymous request, can read it.
 
@@ -454,92 +459,65 @@ attempt. `make frontend-destroy CONFIRM=yes` removes the stack and bucket togeth
 
 ### `infra/backend.yaml`
 
-One CloudFormation stack, named `<PROJECT_NAME>-backend`:
+One CloudFormation stack, named `<PROJECT_NAME>-backend`, built to cost almost nothing while
+nobody is using it:
 
-- **VPC** with two public subnets across two availability zones, an internet gateway, and no
-  NAT gateway. Fargate tasks get a public IP so they can pull from ECR directly; a NAT gateway
-  would cost more than everything else in this stack combined.
-- **RDS PostgreSQL** — `db.t4g.micro`, 20 GB gp2, encrypted, single-AZ, not publicly
-  accessible. Both the class and the storage size are what the Free Tier covers.
-- **ECS Fargate service** — one task at the smallest size available (0.25 vCPU, 512 MB),
-  running the backend image from ECR. The container runs `alembic upgrade head` before Uvicorn,
-  exactly as it does under compose, so the schema is never behind the code.
-- **Application Load Balancer** — HTTP on port 80, health-checking `GET /api/meetings`. That
-  endpoint passes only once migrations have applied and the API is serving.
-- **Three security groups in a chain**: the internet reaches only the load balancer, the load
-  balancer reaches only the tasks, and the tasks reach only the database. The database accepts
-  no connection from anywhere else, including the internet.
+- **Lambda function** running the same backend image compose runs. The
+  [Lambda Web Adapter](https://github.com/awslabs/aws-lambda-web-adapter), copied into the image
+  as an extension, turns each invocation into an HTTP request to Uvicorn, so the app has no
+  Lambda-specific code. Outside Lambda the extension never starts. Each cold start runs
+  `alembic upgrade head` before Uvicorn, exactly as under compose.
+- **Function URL** — the function's own HTTPS endpoint. The frontend reaches it through
+  CloudFront at `/api`, not directly.
+- **Aurora Serverless v2 PostgreSQL** — minimum capacity **0 ACU**, so it pauses after
+  5 minutes idle and bills only storage while paused. The first request after a pause waits
+  about 15 seconds while it resumes. The function sets `DB_KEEP_CONNECTIONS=false`, which makes
+  the app open a connection per request instead of pooling: a pooled connection held by a
+  frozen function would keep the database from ever pausing.
+- **A VPC with two private subnets** and no internet gateway, NAT gateway or public IP. The
+  function reaches the database inside the VPC and needs nothing else from the network.
+- **Two security groups**: the database accepts connections only from the function.
 
-The image is built for `linux/amd64` explicitly, because `make backend-push` may run on an
-Apple Silicon machine while Fargate here runs x86_64.
+The image is built for `linux/amd64` with `--provenance=false`: `make backend-push` may run on
+Apple Silicon, and Lambda rejects the image index buildx produces when it attaches provenance.
+The stack takes the image by digest, not `:latest`, so a new push is a change the stack sees.
 
-**HTTPS needs a domain.** An ALB cannot serve HTTPS without a TLS certificate, and ACM issues
-certificates only for domains you can prove you own — the load balancer's own
-`*.elb.amazonaws.com` hostname belongs to AWS, so there is nothing to attach to a 443 listener.
-The stack therefore has two modes, chosen by `API_DOMAIN` in `.env`:
-
-| `API_DOMAIN` | Listeners                                   | URL                          |
-| ------------ | ------------------------------------------- | ---------------------------- |
-| empty        | 80 only, forwarding to the service           | `http://<alb>.elb.amazonaws.com` |
-| set          | 443 with the certificate; 80 redirects to it | `https://<API_DOMAIN>`       |
-
-This matters beyond neatness: a browser refuses to let an HTTPS page call an HTTP API, blocking
-it as mixed content. So an HTTPS frontend needs an HTTPS backend.
-
-### Adding a domain
-
-The certificate is not created by CloudFormation. ACM will not issue one until a DNS record
-proves ownership, and a stack that waits on a human blocks for hours and then fails. It is a
-separate, resumable step instead.
-
-1. Set `API_DOMAIN=api.example.com` in `.env`.
-2. `make cert` — requests the certificate and prints the CNAME record to add.
-3. Add that CNAME at whatever serves DNS for the domain. Most control panels want only the
-   host part, not the fully qualified name; `make cert` prints both.
-4. `make cert-wait` — blocks until ACM sees the record and issues the certificate.
-5. `make backend-deploy` — finds the issued certificate by domain name and adds the 443
-   listener. It refuses to run if `API_DOMAIN` is set but no issued certificate exists, rather
-   than silently deploying HTTP.
-6. Add a second CNAME pointing `API_DOMAIN` at the load balancer's hostname, which
-   `make backend-url` prints.
-
-The validation CNAME must stay in place for the life of the certificate — ACM re-checks it to
-renew automatically. Deleting it eventually breaks renewal.
-
-If the domain's DNS were hosted in Route 53 in the same account, steps 3 and 6 could be
-records in the template and the whole thing would be one command. With DNS anywhere else, those
-two records are manual.
+HTTPS comes from CloudFront's default certificate, so no domain or ACM certificate is needed.
 
 ### Backend targets
 
 | Target                     | What it does                                                     |
 | -------------------------- | ---------------------------------------------------------------- |
+| `make deploy`              | `backend-deploy`, then `frontend-deploy` wired to it              |
 | `make backend-push`        | Builds the image, creates the ECR repository if needed, pushes it |
-| `make backend-deploy`      | Pushes, deploys the stack, prints the API URL                     |
-| `make backend-url`         | Prints the API URL                                                |
-| `make backend-status`      | Shows desired/running/pending task counts                         |
-| `make backend-redeploy`    | Pushes a new image and forces a new deployment                    |
-| `make backend-logs`        | Tails the container logs from CloudWatch                          |
+| `make backend-deploy`      | Pushes, deploys the stack, prints the function URL                |
+| `make backend-url`         | Prints the function URL                                           |
+| `make backend-status`      | Shows the function's state and whether the database is paused     |
+| `make backend-redeploy`    | Pushes a new image and points the function at it                  |
+| `make backend-logs`        | Tails the function's logs from CloudWatch                         |
 | `make backend-destroy`     | Deletes the API, the database and the VPC. Needs `CONFIRM=yes`    |
-| `make cert`                | Requests the ACM certificate and prints the DNS record to add     |
-| `make cert-wait`           | Blocks until the certificate is issued                            |
 | `make github-oidc`         | Creates the role GitHub Actions assumes. Run once                 |
 
 ### What this costs
 
-The Free Tier covers the database and not much else. Rough monthly figures for `us-east-1`,
-running continuously:
+Nothing in the stack bills by the hour while idle. Rough monthly figures for light use:
 
-| Resource                   | Cost                                                             |
-| -------------------------- | ---------------------------------------------------------------- |
-| RDS `db.t4g.micro`         | **$0** while Free Tier applies (750 hours/month for 12 months), then ~$12 |
-| Fargate 0.25 vCPU + 512 MB | **~$9** — Fargate has no free tier at any size                    |
-| Application Load Balancer  | **~$17** — no free tier, billed per hour whether or not it is used, and HTTP only |
-| ECR, CloudWatch logs, data | Cents at this scale                                               |
+| Resource                        | Cost                                                        |
+| ------------------------------- | ----------------------------------------------------------- |
+| Aurora storage (a few MB–1 GB)  | **~$0.10** per GB-month, plus I/O and backups at cents      |
+| Aurora compute                  | **$0** while paused; ~$0.12 per ACU-hour only while in use  |
+| Lambda                          | **$0** at this scale — the free tier covers 1M requests/month |
+| CloudFront, S3, ECR, logs       | Cents                                                        |
 
-So roughly **$26/month**, of which the load balancer is the largest single item and the one
-piece that buys a stable HTTPS-capable endpoint. `make backend-destroy CONFIRM=yes` removes all
-of it. Nothing here scales to zero on its own.
+So well under **$1/month** when the app sits unused, against about $40 for the previous
+load balancer + Fargate + RDS setup. The trade-off is the first request after a quiet spell,
+which takes about 20 seconds while the function cold-starts and the database resumes.
+
+Every resource carries the tag `Project=<PROJECT_NAME>`: the stacks are deployed with it and
+CloudFormation copies it onto what they create, RDS copies it onto its snapshots, and
+`make backend-push` tags the ECR repository it creates outside CloudFormation. Activate
+`Project` under *Billing → Cost allocation tags* to see this app's spend on its own in Cost
+Explorer.
 
 `make frontend-build` needs no Node on the host. It builds the `build` stage of
 `frontend/Dockerfile` and copies `/srv/dist` out of the image, which is why that Dockerfile has
@@ -603,7 +581,8 @@ confirmation box. Deploying bills money and changes a live system, so it does no
 side effect of a push. A `concurrency` group keeps two runs from touching the stack at once.
 
 It runs `make backend-deploy`, the same target used locally, so there is one deployment path
-rather than two that drift. On failure it runs `make explain-failure`, printing the reason
+rather than two that drift, then makes one request to the API — which cold-starts the function,
+wakes the database and applies any pending migrations. On failure it runs `make explain-failure`, printing the reason
 CloudFormation recorded instead of leaving a bare red cross.
 
 **Configuration.** No credentials are stored in GitHub. The workflow authenticates by OIDC:
@@ -614,7 +593,7 @@ they expire when the job ends. There is no access key to leak, rotate, or forget
 | -------- | ---------------------------- | -------- | ---------------------------------------- |
 | Variable | `AWS_ROLE_ARN`               | yes      | The role to assume. `make github-oidc` prints it |
 | Variable | `AWS_REGION`, `PROJECT_NAME` | yes      |                                          |
-| Variable | `CORS_ORIGINS`, `API_DOMAIN` | no       | Same meaning as in `.env`                |
+| Variable | `CORS_ORIGINS`               | no       | Same meaning as in `.env`                |
 | Secret   | `DB_PASSWORD`                | yes      | The only secret the workflow needs       |
 
 The workflow fails immediately, with an explanation, if `AWS_ROLE_ARN` is unset — rather than
@@ -636,8 +615,7 @@ Creates what OIDC needs, in one stack named `<PROJECT_NAME>-github-oidc`:
 The attached policy is scoped where AWS allows it: CloudFormation only on stacks named
 `<PROJECT_NAME>-*`, ECR only on repositories named `<PROJECT_NAME>-*`, and IAM only on roles
 named `<PROJECT_NAME>-*` — which is what CloudFormation generates for this project's stacks.
-The networking and managed services (`ecs`, `rds`, `ec2`, `elasticloadbalancing`, `logs`, `acm`,
-`s3`, `cloudfront`) are granted on `*`, because their create calls name resources that do not
+The networking and managed services (`lambda`, `rds`, `ec2`, `logs`, `s3`, `cloudfront`) are granted on `*`, because their create calls name resources that do not
 exist yet and cannot be scoped by ARN in advance. This is a deploy role; treat it as privileged.
 
 Run it once:

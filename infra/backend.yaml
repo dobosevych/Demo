@@ -1,9 +1,10 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
-  The meetings backend on ECS Fargate: a VPC, an RDS PostgreSQL instance, a
-  Fargate service running the FastAPI image from ECR, and an Application Load
-  Balancer in front of it. Instance sizes are the smallest available, and the
-  database class is Free Tier eligible.
+  The meetings backend, built to cost almost nothing while idle: the FastAPI
+  image runs on Lambda behind a function URL, and the database is Aurora
+  Serverless v2 with a minimum of 0 ACU, so it pauses when nobody uses it. There
+  is no load balancer, no NAT gateway and no public IP address, which are the
+  things that bill by the hour whether or not anything happens.
 
 Parameters:
   ProjectName:
@@ -12,7 +13,10 @@ Parameters:
     AllowedPattern: "[a-z0-9-]+"
   ImageUri:
     Type: String
-    Description: ECR image URI, e.g. <account>.dkr.ecr.<region>.amazonaws.com/meetings-backend:latest
+    Description: >
+      ECR image URI pinned by digest, e.g.
+      <account>.dkr.ecr.<region>.amazonaws.com/meetings-backend@sha256:...
+      A digest rather than :latest, so that a new image is a change the stack sees.
   DbPassword:
     Type: String
     NoEcho: true
@@ -20,41 +24,37 @@ Parameters:
     MaxLength: 63
     AllowedPattern: "[^/@\" ]+"
     Description: Master password for the database. Comes from .env, never committed.
-  DbInstanceClass:
+  DbEngineVersion:
     Type: String
-    Default: db.t4g.micro
-    Description: Free Tier covers 750 hours/month of db.t4g.micro for 12 months.
-  TaskCpu:
-    Type: String
-    Default: "256"
-    Description: Smallest Fargate size. 256 = 0.25 vCPU.
-  TaskMemory:
-    Type: String
-    Default: "512"
-    Description: Smallest memory allowed at 256 CPU.
+    Default: "16.6"
+    Description: >
+      Aurora PostgreSQL version. Pausing at 0 ACU needs 13.15, 14.12, 15.7, 16.3
+      or later in each line.
+  DbMaxCapacity:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 16
+    Description: Upper bound in ACUs (1 ACU is about 2 GB of memory).
+  DbSecondsUntilPause:
+    Type: Number
+    Default: 300
+    MinValue: 300
+    MaxValue: 86400
+    Description: Idle time before the database pauses. 300 is the minimum.
   CorsOrigins:
     Type: String
     Default: "*"
-    Description: Comma-separated origins the API accepts.
-  CertificateArn:
-    Type: String
-    Default: ""
     Description: >
-      ACM certificate for the API's domain. Empty means HTTP only: an ALB cannot
-      serve HTTPS without a certificate, and a certificate needs a domain.
-  DomainName:
-    Type: String
-    Default: ""
-    Description: The domain the certificate covers, e.g. demo.example.com. Used for the ApiUrl output.
-
-Conditions:
-  HasCertificate: !Not [!Equals [!Ref CertificateArn, ""]]
+      Comma-separated origins the API accepts. The frontend reaches it through
+      its own CloudFront distribution, same-origin, so this only matters for
+      calls made straight to the function URL.
 
 Resources:
   # --- Network -------------------------------------------------------------
-  # Public subnets with an internet gateway, and tasks given a public IP. That
-  # is what lets them pull from ECR without a NAT gateway, which would cost far
-  # more than everything else here combined.
+  # Private subnets only. Lambda reaches the database inside the VPC and needs
+  # nothing from the internet: its image is pulled by the Lambda service and its
+  # logs are shipped by it, not through these subnets.
   Vpc:
     Type: AWS::EC2::VPC
     Properties:
@@ -65,22 +65,12 @@ Resources:
         - Key: Name
           Value: !Sub "${ProjectName}-backend"
 
-  InternetGateway:
-    Type: AWS::EC2::InternetGateway
-
-  AttachGateway:
-    Type: AWS::EC2::VPCGatewayAttachment
-    Properties:
-      VpcId: !Ref Vpc
-      InternetGatewayId: !Ref InternetGateway
-
   SubnetA:
     Type: AWS::EC2::Subnet
     Properties:
       VpcId: !Ref Vpc
       CidrBlock: 10.42.1.0/24
       AvailabilityZone: !Select [0, !GetAZs ""]
-      MapPublicIpOnLaunch: true
 
   SubnetB:
     Type: AWS::EC2::Subnet
@@ -88,74 +78,25 @@ Resources:
       VpcId: !Ref Vpc
       CidrBlock: 10.42.2.0/24
       AvailabilityZone: !Select [1, !GetAZs ""]
-      MapPublicIpOnLaunch: true
-
-  RouteTable:
-    Type: AWS::EC2::RouteTable
-    Properties:
-      VpcId: !Ref Vpc
-
-  DefaultRoute:
-    Type: AWS::EC2::Route
-    DependsOn: AttachGateway
-    Properties:
-      RouteTableId: !Ref RouteTable
-      DestinationCidrBlock: 0.0.0.0/0
-      GatewayId: !Ref InternetGateway
-
-  SubnetARouteAssoc:
-    Type: AWS::EC2::SubnetRouteTableAssociation
-    Properties:
-      SubnetId: !Ref SubnetA
-      RouteTableId: !Ref RouteTable
-
-  SubnetBRouteAssoc:
-    Type: AWS::EC2::SubnetRouteTableAssociation
-    Properties:
-      SubnetId: !Ref SubnetB
-      RouteTableId: !Ref RouteTable
 
   # --- Security groups -----------------------------------------------------
-  LbSecurityGroup:
+  FunctionSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Load balancer. Open to the internet on HTTP.
+      GroupDescription: The API function. Accepts nothing; only connects out to the database.
       VpcId: !Ref Vpc
-      SecurityGroupIngress:
-        - IpProtocol: tcp
-          FromPort: 80
-          ToPort: 80
-          CidrIp: 0.0.0.0/0
-          Description: Public HTTP
-        - IpProtocol: tcp
-          FromPort: 443
-          ToPort: 443
-          CidrIp: 0.0.0.0/0
-          Description: Public HTTPS
-
-  TaskSecurityGroup:
-    Type: AWS::EC2::SecurityGroup
-    Properties:
-      GroupDescription: Fargate tasks. Reachable only from the load balancer.
-      VpcId: !Ref Vpc
-      SecurityGroupIngress:
-        - IpProtocol: tcp
-          FromPort: 8000
-          ToPort: 8000
-          SourceSecurityGroupId: !Ref LbSecurityGroup
-          Description: API port, from the load balancer only
 
   DbSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Database. Reachable only from the tasks.
+      GroupDescription: Database. Reachable only from the function.
       VpcId: !Ref Vpc
       SecurityGroupIngress:
         - IpProtocol: tcp
           FromPort: 5432
           ToPort: 5432
-          SourceSecurityGroupId: !Ref TaskSecurityGroup
-          Description: Postgres, from the Fargate tasks only
+          SourceSecurityGroupId: !Ref FunctionSecurityGroup
+          Description: Postgres, from the API function only
 
   # --- Database ------------------------------------------------------------
   DbSubnetGroup:
@@ -166,109 +107,49 @@ Resources:
         - !Ref SubnetA
         - !Ref SubnetB
 
-  Database:
+  DbCluster:
+    Type: AWS::RDS::DBCluster
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      DBClusterIdentifier: !Sub "${ProjectName}-backend"
+      Engine: aurora-postgresql
+      EngineVersion: !Ref DbEngineVersion
+      DatabaseName: meetings
+      MasterUsername: meetings
+      MasterUserPassword: !Ref DbPassword
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VpcSecurityGroupIds:
+        - !GetAtt DbSecurityGroup.GroupId
+      # MinCapacity 0 is what lets it pause. The first connection after a pause
+      # waits roughly 15 seconds while it resumes.
+      ServerlessV2ScalingConfiguration:
+        MinCapacity: 0
+        MaxCapacity: !Ref DbMaxCapacity
+        SecondsUntilAutoPause: !Ref DbSecondsUntilPause
+      StorageEncrypted: true
+      BackupRetentionPeriod: 1
+      CopyTagsToSnapshot: true
+      DeletionProtection: false
+
+  DbInstance:
     Type: AWS::RDS::DBInstance
     DeletionPolicy: Delete
     UpdateReplacePolicy: Delete
     Properties:
-      DBInstanceIdentifier: !Sub "${ProjectName}-backend-db"
-      Engine: postgres
-      EngineVersion: "16"
-      DBInstanceClass: !Ref DbInstanceClass
-      # 20 GB of gp2 is exactly what Free Tier covers.
-      AllocatedStorage: "20"
-      StorageType: gp2
-      StorageEncrypted: true
-      DBName: meetings
-      MasterUsername: meetings
-      MasterUserPassword: !Ref DbPassword
-      DBSubnetGroupName: !Ref DbSubnetGroup
-      VPCSecurityGroups:
-        - !GetAtt DbSecurityGroup.GroupId
+      DBClusterIdentifier: !Ref DbCluster
+      DBInstanceClass: db.serverless
+      Engine: aurora-postgresql
       PubliclyAccessible: false
-      MultiAZ: false
-      BackupRetentionPeriod: 1
-      DeletionProtection: false
 
-  # --- Load balancer -------------------------------------------------------
-  LoadBalancer:
-    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
-    Properties:
-      Name: !Sub "${ProjectName}-backend-lb"
-      Type: application
-      Scheme: internet-facing
-      SecurityGroups:
-        - !Ref LbSecurityGroup
-      Subnets:
-        - !Ref SubnetA
-        - !Ref SubnetB
-
-  TargetGroup:
-    Type: AWS::ElasticLoadBalancingV2::TargetGroup
-    Properties:
-      Name: !Sub "${ProjectName}-backend-tg"
-      VpcId: !Ref Vpc
-      Port: 8000
-      Protocol: HTTP
-      TargetType: ip
-      # The same endpoint compose uses: it passes only once migrations have
-      # applied and the API is serving.
-      HealthCheckPath: /api/meetings
-      HealthCheckIntervalSeconds: 30
-      HealthCheckTimeoutSeconds: 10
-      HealthyThresholdCount: 2
-      UnhealthyThresholdCount: 5
-      Matcher:
-        HttpCode: "200"
-      TargetGroupAttributes:
-        - Key: deregistration_delay.timeout_seconds
-          Value: "10"
-
-  # Port 80. With a certificate it only redirects; without one it is the API.
-  Listener:
-    Type: AWS::ElasticLoadBalancingV2::Listener
-    Properties:
-      LoadBalancerArn: !Ref LoadBalancer
-      Port: 80
-      Protocol: HTTP
-      DefaultActions:
-        - !If
-          - HasCertificate
-          - Type: redirect
-            RedirectConfig:
-              Protocol: HTTPS
-              Port: "443"
-              StatusCode: HTTP_301
-          - Type: forward
-            TargetGroupArn: !Ref TargetGroup
-
-  HttpsListener:
-    Type: AWS::ElasticLoadBalancingV2::Listener
-    Condition: HasCertificate
-    Properties:
-      LoadBalancerArn: !Ref LoadBalancer
-      Port: 443
-      Protocol: HTTPS
-      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
-      Certificates:
-        - CertificateArn: !Ref CertificateArn
-      DefaultActions:
-        - Type: forward
-          TargetGroupArn: !Ref TargetGroup
-
-  # --- ECS -----------------------------------------------------------------
-  Cluster:
-    Type: AWS::ECS::Cluster
-    Properties:
-      ClusterName: !Sub "${ProjectName}-backend"
-
+  # --- API -----------------------------------------------------------------
   LogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
-      LogGroupName: !Sub "/ecs/${ProjectName}-backend"
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-backend"
       RetentionInDays: 7
 
-  ExecutionRole:
+  FunctionRole:
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
@@ -276,87 +157,83 @@ Resources:
         Statement:
           - Effect: Allow
             Principal:
-              Service: ecs-tasks.amazonaws.com
+              Service: lambda.amazonaws.com
             Action: sts:AssumeRole
       ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+        # Logs, plus the network interfaces a function in a VPC needs.
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
 
-  TaskDefinition:
-    Type: AWS::ECS::TaskDefinition
+  # The same image compose runs. The Lambda Web Adapter baked into it turns each
+  # invocation into an HTTP request to uvicorn, so the app needs no Lambda code.
+  Function:
+    Type: AWS::Lambda::Function
     Properties:
-      Family: !Sub "${ProjectName}-backend"
-      RequiresCompatibilities:
-        - FARGATE
-      NetworkMode: awsvpc
-      Cpu: !Ref TaskCpu
-      Memory: !Ref TaskMemory
-      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
-      RuntimePlatform:
-        CpuArchitecture: X86_64
-        OperatingSystemFamily: LINUX
-      ContainerDefinitions:
-        - Name: api
-          Image: !Ref ImageUri
-          Essential: true
-          PortMappings:
-            - ContainerPort: 8000
-              Protocol: tcp
-          Environment:
-            - Name: DATABASE_URL
-              Value: !Sub "postgresql+psycopg://meetings:${DbPassword}@${Database.Endpoint.Address}:${Database.Endpoint.Port}/meetings"
-            - Name: CORS_ORIGINS
-              Value: !Ref CorsOrigins
-          LogConfiguration:
-            LogDriver: awslogs
-            Options:
-              awslogs-group: !Ref LogGroup
-              awslogs-region: !Ref AWS::Region
-              awslogs-stream-prefix: api
+      FunctionName: !Sub "${ProjectName}-backend"
+      PackageType: Image
+      Code:
+        ImageUri: !Ref ImageUri
+      Architectures: [x86_64]
+      Role: !GetAtt FunctionRole.Arn
+      MemorySize: 1024
+      # Covers a cold start that also has to wake the database.
+      Timeout: 60
+      LoggingConfig:
+        LogGroup: !Ref LogGroup
+      VpcConfig:
+        SubnetIds:
+          - !Ref SubnetA
+          - !Ref SubnetB
+        SecurityGroupIds:
+          - !Ref FunctionSecurityGroup
+      Environment:
+        Variables:
+          DATABASE_URL: !Sub "postgresql+psycopg://meetings:${DbPassword}@${DbCluster.Endpoint.Address}:${DbCluster.Endpoint.Port}/meetings"
+          # A pooled connection held by a frozen function would keep the
+          # database from ever pausing.
+          DB_KEEP_CONNECTIONS: "false"
+          CORS_ORIGINS: !Ref CorsOrigins
+          AWS_LWA_PORT: "8000"
+          # Startup runs migrations and may wait on a paused database, which can
+          # outlast Lambda's 10-second init phase. This lets it finish inside
+          # the first invocation instead of failing init.
+          AWS_LWA_ASYNC_INIT: "true"
 
-  Service:
-    Type: AWS::ECS::Service
-    # Nothing can register as healthy before the listener exists.
-    DependsOn: Listener
+  FunctionUrl:
+    Type: AWS::Lambda::Url
     Properties:
-      ServiceName: !Sub "${ProjectName}-backend"
-      Cluster: !Ref Cluster
-      TaskDefinition: !Ref TaskDefinition
-      LaunchType: FARGATE
-      DesiredCount: 1
-      # The container runs `alembic upgrade head` before uvicorn, so give it
-      # room to finish before health checks start counting.
-      HealthCheckGracePeriodSeconds: 120
-      DeploymentConfiguration:
-        MinimumHealthyPercent: 0
-        MaximumPercent: 200
-      NetworkConfiguration:
-        AwsvpcConfiguration:
-          # Required to pull the image without a NAT gateway.
-          AssignPublicIp: ENABLED
-          Subnets:
-            - !Ref SubnetA
-            - !Ref SubnetB
-          SecurityGroups:
-            - !Ref TaskSecurityGroup
-      LoadBalancers:
-        - ContainerName: api
-          ContainerPort: 8000
-          TargetGroupArn: !Ref TargetGroup
+      TargetFunctionArn: !GetAtt Function.Arn
+      AuthType: NONE
+
+  # A public function URL needs both permissions.
+  FunctionUrlPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref Function
+      Action: lambda:InvokeFunctionUrl
+      Principal: "*"
+      FunctionUrlAuthType: NONE
+
+  FunctionInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref Function
+      Action: lambda:InvokeFunction
+      Principal: "*"
+      InvokedViaFunctionUrl: true
 
 Outputs:
   ApiUrl:
-    Description: Base URL of the API. Use this as VITE_API_URL for the frontend.
-    Value: !If
-      - HasCertificate
-      - !Sub "https://${DomainName}"
-      - !Sub "http://${LoadBalancer.DNSName}"
-  LoadBalancerDomain:
-    Description: The ALB's own hostname. Point your domain's CNAME at this.
-    Value: !GetAtt LoadBalancer.DNSName
-  ClusterName:
-    Value: !Ref Cluster
-  ServiceName:
-    Value: !GetAtt Service.Name
+    Description: >
+      The function URL, callable directly. The frontend does not use it: it
+      reaches the API at /api on its own CloudFront domain.
+    Value: !GetAtt FunctionUrl.FunctionUrl
+  ApiOriginDomain:
+    Description: Hostname of the function URL. The frontend stack's /api origin.
+    Value: !Select [2, !Split ["/", !GetAtt FunctionUrl.FunctionUrl]]
+  FunctionName:
+    Value: !Ref Function
+  DbClusterId:
+    Value: !Ref DbCluster
   DbEndpoint:
     Description: Database address. Reachable only from inside the VPC.
-    Value: !GetAtt Database.Endpoint.Address
+    Value: !GetAtt DbCluster.Endpoint.Address
