@@ -48,10 +48,10 @@ Parameters:
     Type: String
     Default: "*"
     Description: >
-      Comma-separated origins the API accepts. The frontend reaches it through
-      its own CloudFront distribution, same-origin, so this only matters for
-      calls made straight to the function URL.
-  ApiDomainName:
+      Comma-separated origins the API accepts. The deployed frontend calls the
+      function URL directly from its CloudFront domain, so that domain must be
+      allowed here (or leave it "*").
+  BackendDomainName:
     Type: String
     Default: ""
     Description: >
@@ -61,7 +61,7 @@ Parameters:
       CNAMEs must be added by hand; `make backend-dns` prints them.
 
 Conditions:
-  HasApiDomain: !Not [!Equals [!Ref ApiDomainName, ""]]
+  HasBackendDomain: !Not [!Equals [!Ref BackendDomainName, ""]]
 
 Resources:
   # --- Network -------------------------------------------------------------
@@ -276,22 +276,22 @@ Resources:
   # terminal and add the records it prints.
   ApiCertificate:
     Type: AWS::CertificateManager::Certificate
-    Condition: HasApiDomain
+    Condition: HasBackendDomain
     Properties:
-      DomainName: !Ref ApiDomainName
+      DomainName: !Ref BackendDomainName
       ValidationMethod: DNS
       Tags:
         - Key: PROJECT_NAME
           Value: !Ref ProjectName
 
-  # The app serves everything under /api (that is what CloudFront routes to it),
-  # but on its own domain the API lives at the root. So the HTTP API proxies to
-  # the function URL and puts the /api back: /meetings -> /api/meetings. The
-  # function URL is public already, so no extra invoke permission is needed,
-  # and API Gateway sends the function URL's own Host header, which it requires.
+  # The HTTP API passes paths through unchanged, so the domain serves exactly
+  # what the function URL does: /api/meetings is /api/meetings on both, and the
+  # frontend bundle can use either as its base URL. The function URL is public
+  # already, so no extra invoke permission is needed, and API Gateway sends the
+  # function URL's own Host header, which it requires.
   HttpApi:
     Type: AWS::ApiGatewayV2::Api
-    Condition: HasApiDomain
+    Condition: HasBackendDomain
     Properties:
       Name: !Sub "${ProjectName}-backend"
       ProtocolType: HTTP
@@ -300,29 +300,29 @@ Resources:
 
   HttpApiRootIntegration:
     Type: AWS::ApiGatewayV2::Integration
-    Condition: HasApiDomain
+    Condition: HasBackendDomain
     Properties:
       ApiId: !Ref HttpApi
       IntegrationType: HTTP_PROXY
       IntegrationMethod: ANY
-      IntegrationUri: !Sub "${FunctionUrl.FunctionUrl}api"
+      IntegrationUri: !GetAtt FunctionUrl.FunctionUrl
       PayloadFormatVersion: "1.0"
       TimeoutInMillis: 30000
 
   HttpApiProxyIntegration:
     Type: AWS::ApiGatewayV2::Integration
-    Condition: HasApiDomain
+    Condition: HasBackendDomain
     Properties:
       ApiId: !Ref HttpApi
       IntegrationType: HTTP_PROXY
       IntegrationMethod: ANY
-      IntegrationUri: !Sub "${FunctionUrl.FunctionUrl}api/{proxy}"
+      IntegrationUri: !Sub "${FunctionUrl.FunctionUrl}{proxy}"
       PayloadFormatVersion: "1.0"
       TimeoutInMillis: 30000
 
   HttpApiRootRoute:
     Type: AWS::ApiGatewayV2::Route
-    Condition: HasApiDomain
+    Condition: HasBackendDomain
     Properties:
       ApiId: !Ref HttpApi
       RouteKey: "ANY /"
@@ -330,7 +330,7 @@ Resources:
 
   HttpApiProxyRoute:
     Type: AWS::ApiGatewayV2::Route
-    Condition: HasApiDomain
+    Condition: HasBackendDomain
     Properties:
       ApiId: !Ref HttpApi
       RouteKey: "ANY /{proxy+}"
@@ -338,7 +338,7 @@ Resources:
 
   HttpApiStage:
     Type: AWS::ApiGatewayV2::Stage
-    Condition: HasApiDomain
+    Condition: HasBackendDomain
     Properties:
       ApiId: !Ref HttpApi
       StageName: $default
@@ -348,9 +348,9 @@ Resources:
 
   ApiDomain:
     Type: AWS::ApiGatewayV2::DomainName
-    Condition: HasApiDomain
+    Condition: HasBackendDomain
     Properties:
-      DomainName: !Ref ApiDomainName
+      DomainName: !Ref BackendDomainName
       DomainNameConfigurations:
         - CertificateArn: !Ref ApiCertificate
           EndpointType: REGIONAL
@@ -360,7 +360,7 @@ Resources:
 
   ApiDomainMapping:
     Type: AWS::ApiGatewayV2::ApiMapping
-    Condition: HasApiDomain
+    Condition: HasBackendDomain
     Properties:
       ApiId: !Ref HttpApi
       DomainName: !Ref ApiDomain
@@ -369,12 +369,9 @@ Resources:
 Outputs:
   ApiUrl:
     Description: >
-      The function URL, callable directly. The frontend does not use it: it
-      reaches the API at /api on its own CloudFront domain.
+      The function URL. The frontend bundle is built against it and calls
+      /api/... on it directly.
     Value: !GetAtt FunctionUrl.FunctionUrl
-  ApiOriginDomain:
-    Description: Hostname of the function URL. The frontend stack's /api origin.
-    Value: !Select [2, !Split ["/", !GetAtt FunctionUrl.FunctionUrl]]
   FunctionName:
     Value: !Ref Function
   DbClusterId:
@@ -383,12 +380,12 @@ Outputs:
     Description: Database address. Reachable only from inside the VPC.
     Value: !GetAtt DbCluster.Endpoint.Address
   ApiDomainUrl:
-    Condition: HasApiDomain
+    Condition: HasBackendDomain
     Description: >
-      The API on its custom domain, once its CNAME is in DNS. Served at the
-      root: /meetings here is /api/meetings on the function.
-    Value: !Sub "https://${ApiDomainName}"
+      The API on its custom domain, once its CNAME is in DNS. Same paths as
+      the function URL. The frontend bundle is built against it.
+    Value: !Sub "https://${BackendDomainName}"
   ApiDomainTarget:
-    Condition: HasApiDomain
+    Condition: HasBackendDomain
     Description: What the custom domain's CNAME must point to.
     Value: !GetAtt ApiDomain.RegionalDomainName

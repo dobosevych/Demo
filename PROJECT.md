@@ -391,9 +391,10 @@ to AWS as two independent stacks:
 
 They are deliberately independent. The frontend can be deployed before the backend exists: with
 no backend the site loads, renders and explains that it has no backend, instead of failing to
-boot. Once the backend is deployed, `make frontend-deploy` routes `/api/*` on the frontend's
-CloudFront distribution to it and builds the bundle with `VITE_API_URL=/`, so the browser calls
-the API same-origin over HTTPS. `make deploy` does both, in that order.
+boot. Once the backend is deployed, `make frontend-deploy` builds the bundle with
+`VITE_API_URL` set to `https://<BACKEND_DOMAIN>` (or, without one, the backend's function URL),
+so the browser calls the API directly over
+HTTPS. CloudFront serves only the static frontend. `make deploy` does both, in that order.
 
 ### Credentials
 
@@ -411,9 +412,21 @@ env file: nothing is generated from it.
 | `AWS_ACCESS_KEY_ID`     | yes      | Checked by `make aws-check` before anything is created      |
 | `AWS_SECRET_ACCESS_KEY` | yes      |                                                            |
 | `AWS_SESSION_TOKEN`     | no       | Only for temporary STS or SSO credentials                   |
-| `AWS_REGION`            | no       | Defaults to `us-east-1`. Where the bucket and stack live    |
+| `AWS_REGION`            | no       | Defaults to `us-east-1`, and must stay there: see below     |
 | `PROJECT_NAME`          | no       | Defaults to `meetings`. Prefixes every resource name        |
-| `VITE_API_URL`          | no       | Leave empty: same-origin `/api` once the backend exists     |
+| `BACKEND_DOMAIN`        | no       | API hostname; also the URL the bundle calls (`VITE_API_URL`) |
+| `FRONTEND_DOMAIN`       | no       | Site hostname on CloudFront. `make frontend-dns` prints DNS  |
+
+`VITE_API_URL` is not set in `.env`: the Makefile derives it from `BACKEND_DOMAIN`.
+
+**Everything lives in `us-east-1`.** CloudFront accepts certificates and `CLOUDFRONT`-scope web
+ACLs from that region only, and keeping both stacks there means nothing is split across regions.
+The frontend template refuses to deploy anywhere else.
+
+**Custom site domain.** With `FRONTEND_DOMAIN` set, the frontend stack creates an ACM
+certificate for it and waits until it is issued: on the first deploy, run `make frontend-dns` in
+another terminal and add the validation CNAME and the site's CNAME it prints. An apex domain
+cannot be a CNAME: use a subdomain or your DNS provider's ALIAS/flattening.
 
 ### `infra/frontend.yaml`
 
@@ -426,9 +439,13 @@ One CloudFormation stack, named `<PROJECT_NAME>-frontend`:
   the default root object. A small CloudFront Function serves `/index.html` for any path without
   a file extension, because those belong to the single-page app, not to S3. (Custom error
   responses would do the same but also rewrite the API's own `404`s into HTML.)
-- **`/api/*` behavior** — only when the backend is deployed (`ApiOriginDomain` parameter, taken
-  from the backend stack by `make infra-deploy`). Forwards to the Lambda function URL uncached,
-  with a 60-second origin timeout to cover a cold start that also wakes the database.
+  It serves only the frontend; the API is not routed through it.
+- **WAF web ACL** (`CLOUDFRONT` scope, allow-all, no rules) — required by the flat-rate plan
+  and included in it.
+- **Flat-rate Free plan** (`AWS::PricingPlanManager::Subscription`, `PlanTier: FREE`) — $0 a
+  month with no overage charges, covering the distribution and the web ACL. It activates
+  immediately; an account can hold at most three Free plans.
+- **ACM certificate** — only with `FRONTEND_DOMAIN`, which then becomes the distribution's alias.
 - **Bucket policy** — grants `s3:GetObject` to the CloudFront service principal, conditioned on
   this distribution's ARN. No other distribution, and no anonymous request, can read it.
 
@@ -466,8 +483,8 @@ nobody is using it:
   as an extension, turns each invocation into an HTTP request to Uvicorn, so the app has no
   Lambda-specific code. Outside Lambda the extension never starts. Each cold start runs
   `alembic upgrade head` before Uvicorn, exactly as under compose.
-- **Function URL** — the function's own HTTPS endpoint. The frontend reaches it through
-  CloudFront at `/api`, not directly.
+- **Function URL** — the function's own HTTPS endpoint. The frontend calls it directly,
+  cross-origin, so `CORS_ORIGINS` must allow the CloudFront domain (the default `*` does).
 - **Aurora Serverless v2 PostgreSQL** — minimum capacity **0 ACU**, so it pauses after
   5 minutes idle and bills only storage while paused. The first request after a pause waits
   about 15 seconds while it resumes. The function sets `DB_KEEP_CONNECTIONS=false`, which makes
@@ -506,7 +523,8 @@ Nothing in the stack bills by the hour while idle. Rough monthly figures for lig
 | Aurora storage (a few MB–1 GB)  | **~$0.10** per GB-month, plus I/O and backups at cents      |
 | Aurora compute                  | **$0** while paused; ~$0.12 per ACU-hour only while in use  |
 | Lambda                          | **$0** at this scale — the free tier covers 1M requests/month |
-| CloudFront, S3, ECR, logs       | Cents                                                        |
+| CloudFront + WAF                | **$0** on the flat-rate Free plan                            |
+| S3, ECR, logs                   | Cents                                                        |
 
 So well under **$1/month** when the app sits unused, against about $40 for the previous
 load balancer + Fargate + RDS setup. The trade-off is the first request after a quiet spell,

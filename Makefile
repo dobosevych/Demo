@@ -27,6 +27,8 @@ export
 endif
 
 # The aws CLI reads AWS_DEFAULT_REGION; .env is allowed to set either spelling.
+# us-east-1: CloudFront takes certificates and web ACLs from there only, and
+# everything is kept in one region.
 AWS_REGION ?= us-east-1
 AWS_DEFAULT_REGION ?= $(AWS_REGION)
 export AWS_DEFAULT_REGION
@@ -37,8 +39,10 @@ TEMPLATE := infra/frontend.yaml
 BACKEND_TEMPLATE := infra/backend.yaml
 BACKEND_STACK ?= $(PROJECT_NAME)-backend
 
-# Custom hostname for the backend API, from .env. Empty deploys without one.
-API_DOMAIN ?=
+# Custom hostnames, from .env. Empty deploys without them. BACKEND_DOMAIN is
+# also the URL the frontend bundle calls; FRONTEND_DOMAIN goes on CloudFront.
+BACKEND_DOMAIN ?=
+FRONTEND_DOMAIN ?=
 
 # GitHub repository allowed to deploy, as owner/name.
 GITHUB_REPO ?=
@@ -54,10 +58,6 @@ DIST := frontend/dist
 # Billing > Cost allocation tags to see this app's spend on its own.
 TAG_KEY ?= PROJECT_NAME
 TAG_VALUE ?= $(PROJECT_NAME)
-
-# Baked into the bundle at build time. Empty is deliberate and supported: the
-# site deploys and renders, and says it has no backend instead of blanking.
-VITE_API_URL ?=
 
 # $(shell) does not see variables exported from .env in GNU Make 3.81, the one
 # macOS ships, so the lookups below hand the AWS settings over explicitly.
@@ -75,18 +75,20 @@ backend_output = $(shell $(aws_env) aws cloudformation describe-stacks \
 	--query "Stacks[0].Outputs[?OutputKey=='$(1)'].OutputValue" \
 	--output text 2>/dev/null)
 
-# The backend's function URL host, or empty when no backend is deployed. When it
-# is set, the distribution routes /api/* to it and the bundle calls the API
-# same-origin ("/"), unless VITE_API_URL in .env says otherwise.
-API_ORIGIN = $(filter-out None,$(call backend_output,ApiOriginDomain))
-BUNDLE_API_URL = $(if $(VITE_API_URL),$(VITE_API_URL),$(if $(API_ORIGIN),/))
+# What the bundle calls, baked in at build time as VITE_API_URL: the backend's
+# custom domain if it has one, else its function URL, else empty — the site then
+# still deploys and renders, and says it has no backend instead of blanking.
+# CloudFront serves only the frontend, so these calls are cross-origin, allowed
+# by CORS_ORIGINS.
+API_URL = $(filter-out None,$(call backend_output,ApiUrl))
+BUNDLE_API_URL = $(if $(BACKEND_DOMAIN),https://$(BACKEND_DOMAIN),$(API_URL))
 
 .PHONY: help aws-check frontend-build infra-deploy frontend-sync frontend-invalidate \
         frontend-deploy frontend-url frontend-status frontend-events frontend-destroy \
         purge-failed-stack explain-failure clean deploy \
         github-oidc github-oidc-verify \
         backend-push backend-deploy backend-url backend-redeploy backend-status \
-        backend-logs backend-destroy backend-dns
+        backend-logs backend-destroy backend-dns frontend-dns
 
 help: ## Show this help
 	@echo "Local development:"
@@ -97,7 +99,7 @@ help: ## Show this help
 		| awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
 	@echo
 	@echo "Variables:  STACK_NAME=$(STACK_NAME)  AWS_REGION=$(AWS_REGION)"
-	@echo "            VITE_API_URL=$(if $(VITE_API_URL),$(VITE_API_URL),<empty: same-origin /api once the backend is deployed>)"
+	@echo "            BACKEND_DOMAIN=$(BACKEND_DOMAIN)  FRONTEND_DOMAIN=$(FRONTEND_DOMAIN)"
 
 deploy: backend-deploy frontend-deploy ## Deploy everything: backend, then the frontend wired to it
 
@@ -148,15 +150,46 @@ infra-deploy: aws-check ## Create or update the S3 + CloudFront stack
 		$(MAKE) --no-print-directory purge-failed-stack; \
 	fi
 	@echo "Deploying stack $(STACK_NAME)…"
+	@test -z "$(FRONTEND_DOMAIN)" || echo "Waiting on the $(FRONTEND_DOMAIN) certificate: run 'make frontend-dns' in another terminal and add the records."
 	@aws cloudformation deploy \
 		--template-file $(TEMPLATE) \
 		--stack-name $(STACK_NAME) \
-		--parameter-overrides ProjectName=$(PROJECT_NAME) ApiOriginDomain=$(API_ORIGIN) \
+		--parameter-overrides ProjectName=$(PROJECT_NAME) FrontendDomain='$(FRONTEND_DOMAIN)' \
 		--tags $(TAG_KEY)=$(TAG_VALUE) \
 		--no-fail-on-empty-changeset \
 		|| { $(MAKE) --no-print-directory explain-failure; exit 1; }
 	@echo "Bucket:       $(call stack_output,BucketName)"
 	@echo "Distribution: $(call stack_output,DistributionId)"
+
+frontend-dns: ## Print the DNS records the site's custom domain needs
+	@test -n "$(FRONTEND_DOMAIN)" || { echo "FRONTEND_DOMAIN is empty; no custom domain configured."; exit 1; }
+	@cert=$$(aws cloudformation describe-stack-resource --stack-name $(STACK_NAME) \
+		--logical-resource-id Certificate \
+		--query "StackResourceDetail.PhysicalResourceId" --output text 2>/dev/null); \
+	echo; \
+	echo "  Add these at the DNS provider for $(FRONTEND_DOMAIN):"; \
+	echo; \
+	if [ -n "$$cert" ] && [ "$$cert" != "None" ]; then \
+		aws acm describe-certificate --certificate-arn "$$cert" \
+			--query "Certificate.[Status,DomainValidationOptions[0].ResourceRecord.Name,DomainValidationOptions[0].ResourceRecord.Value]" \
+			--output text | while read -r status name value; do \
+			echo "  1. Certificate validation ($$status)"; \
+			echo "     CNAME  $$name"; \
+			echo "        ->  $$value"; \
+		done; \
+	else \
+		echo "  1. Certificate not created yet. Run this again once infra-deploy has started it."; \
+	fi; \
+	target="$(call stack_output,DistributionDomain)"; \
+	echo; \
+	if [ -n "$$target" ] && [ "$$target" != "None" ]; then \
+		echo "  2. The site itself"; \
+		echo "     CNAME  $(FRONTEND_DOMAIN)."; \
+		echo "        ->  $$target"; \
+	else \
+		echo "  2. The site's CNAME target exists once the certificate is issued and the deploy finishes."; \
+	fi; \
+	echo
 
 frontend-sync: ## Upload frontend/dist to the stack's bucket
 	@test -d $(DIST) || { echo "$(DIST) is missing. Run: make frontend-build"; exit 1; }
@@ -191,8 +224,8 @@ explain-failure: ## Print why the last stack operation failed, with what to do a
 	@echo
 	@echo "CloudFormation reported:"
 	@reasons=$$(aws cloudformation describe-stack-events --stack-name $(STACK_NAME) \
-		--query "StackEvents[?ResourceStatus=='CREATE_FAILED'||ResourceStatus=='UPDATE_FAILED'].[LogicalResourceId,ResourceStatusReason]" \
-		--output text 2>/dev/null); \
+		--query "StackEvents[?ResourceStatus=='CREATE_FAILED'||ResourceStatus=='UPDATE_FAILED'||((ResourceStatus=='ROLLBACK_IN_PROGRESS'||ResourceStatus=='UPDATE_ROLLBACK_IN_PROGRESS')&&ResourceStatusReason!=null)].[LogicalResourceId,ResourceStatusReason]" \
+		--output text 2>/dev/null | head -n 5); \
 	if [ -z "$$reasons" ]; then echo "  (no failure events found)"; else \
 		echo "$$reasons" | fold -s -w 100 | sed 's/^/  /'; fi; \
 	if echo "$$reasons" | grep -q "must be verified"; then \
@@ -371,7 +404,7 @@ backend-deploy: backend-push ## Deploy the database and the API, then print the 
 			ImageUri="$$image" \
 			DbPassword='$(DB_PASSWORD)' \
 			CorsOrigins='$(CORS_ORIGINS)' \
-			ApiDomainName='$(API_DOMAIN)' \
+			BackendDomainName='$(BACKEND_DOMAIN)' \
 		|| { $(MAKE) --no-print-directory STACK_NAME=$(BACKEND_STACK) explain-failure; exit 1; }
 	@$(MAKE) --no-print-directory backend-url
 
@@ -381,8 +414,8 @@ backend-url: ## Print the deployed API URL
 	echo; \
 	echo "  Function URL: $$url"; \
 	echo; \
-	echo "  The frontend reaches it same-origin, at /api on its CloudFront domain."; \
-	echo "  After the first backend deploy, wire that up with: make frontend-deploy"; \
+	echo "  The frontend calls it directly; CloudFront serves only the static site."; \
+	echo "  After the first backend deploy, rebuild the bundle with: make frontend-deploy"; \
 	echo; \
 	echo "  The first request after the database has paused takes ~20 seconds."; \
 	domain="$(call backend_output,ApiDomainUrl)"; \
@@ -392,12 +425,12 @@ backend-url: ## Print the deployed API URL
 	fi
 
 backend-dns: ## Print the DNS records the API's custom domain needs
-	@test -n "$(API_DOMAIN)" || { echo "API_DOMAIN is empty; no custom domain configured."; exit 1; }
+	@test -n "$(BACKEND_DOMAIN)" || { echo "BACKEND_DOMAIN is empty; no custom domain configured."; exit 1; }
 	@cert=$$(aws cloudformation describe-stack-resource --stack-name $(BACKEND_STACK) \
 		--logical-resource-id ApiCertificate \
 		--query "StackResourceDetail.PhysicalResourceId" --output text 2>/dev/null); \
 	echo; \
-	echo "  Add these at the DNS provider for $(API_DOMAIN):"; \
+	echo "  Add these at the DNS provider for $(BACKEND_DOMAIN):"; \
 	echo; \
 	if [ -n "$$cert" ] && [ "$$cert" != "None" ]; then \
 		aws acm describe-certificate --certificate-arn "$$cert" \
@@ -414,7 +447,7 @@ backend-dns: ## Print the DNS records the API's custom domain needs
 	echo; \
 	if [ -n "$$target" ] && [ "$$target" != "None" ]; then \
 		echo "  2. The API itself"; \
-		echo "     CNAME  $(API_DOMAIN)."; \
+		echo "     CNAME  $(BACKEND_DOMAIN)."; \
 		echo "        ->  $$target"; \
 	else \
 		echo "  2. The API's CNAME target exists once the certificate is issued and the deploy finishes."; \

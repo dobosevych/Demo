@@ -3,8 +3,8 @@ Description: >
   Static hosting for the meetings frontend: a private S3 bucket holding the Vite
   bundle, fronted by CloudFront. The bucket is never public; CloudFront reaches it
   through an Origin Access Control, and the bucket policy trusts only this
-  distribution. When the backend is deployed, /api/* on the same distribution is
-  routed to its Lambda function URL, so the API is same-origin and HTTPS.
+  distribution. The distribution serves the frontend only, on the CloudFront
+  flat-rate Free plan; the browser calls the backend directly.
 
 Parameters:
   ProjectName:
@@ -12,15 +12,26 @@ Parameters:
     Default: meetings
     Description: Prefix for resource names.
     AllowedPattern: "[a-z0-9-]+"
-  ApiOriginDomain:
+  FrontendDomain:
     Type: String
     Default: ""
     Description: >
-      Hostname of the backend's function URL (the backend stack's
-      ApiOriginDomain output). Empty serves the site with no /api route.
+      Custom hostname for the site, e.g. demo.dobosevych.com. Empty serves it
+      on the *.cloudfront.net domain only. The DNS lives outside Route 53, so
+      two CNAMEs must be added by hand; `make frontend-dns` prints them.
 
 Conditions:
-  HasApi: !Not [!Equals [!Ref ApiOriginDomain, ""]]
+  HasDomain: !Not [!Equals [!Ref FrontendDomain, ""]]
+
+# CloudFront takes certificates and CLOUDFRONT-scope web ACLs from us-east-1
+# only, so this stack must live there. Fail at validation, not mid-create.
+Rules:
+  UsEast1Only:
+    Assertions:
+      - Assert: !Equals [!Ref AWS::Region, us-east-1]
+        AssertDescription: >
+          Deploy this stack in us-east-1 (AWS_REGION=us-east-1): CloudFront
+          accepts certificates and web ACLs from that region only.
 
 Resources:
   SiteBucket:
@@ -78,6 +89,36 @@ Resources:
           return request;
         }
 
+  # Required by the flat-rate plan, and included in it. Allow-all with no
+  # rules: the plan's DDoS protection applies regardless.
+  WebAcl:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Sub "${ProjectName}-frontend"
+      Scope: CLOUDFRONT
+      DefaultAction:
+        Allow: {}
+      VisibilityConfig:
+        SampledRequestsEnabled: false
+        CloudWatchMetricsEnabled: false
+        MetricName: !Sub "${ProjectName}-frontend"
+      Tags:
+        - Key: PROJECT_NAME
+          Value: !Ref ProjectName
+
+  # Stays PENDING_VALIDATION until its CNAME is in DNS, and the stack waits on
+  # it: on the first deploy, run `make frontend-dns` in another terminal and
+  # add the records it prints.
+  Certificate:
+    Type: AWS::CertificateManager::Certificate
+    Condition: HasDomain
+    Properties:
+      DomainName: !Ref FrontendDomain
+      ValidationMethod: DNS
+      Tags:
+        - Key: PROJECT_NAME
+          Value: !Ref ProjectName
+
   Distribution:
     Type: AWS::CloudFront::Distribution
     Properties:
@@ -86,23 +127,14 @@ Resources:
         Comment: !Sub "${ProjectName} frontend"
         DefaultRootObject: index.html
         HttpVersion: http2and3
-        PriceClass: PriceClass_100
+        # A WAFv2 web ACL is associated by ARN; the flat-rate plan requires one.
+        WebACLId: !GetAtt WebAcl.Arn
         Origins:
           - Id: s3-site
             DomainName: !GetAtt SiteBucket.RegionalDomainName
             OriginAccessControlId: !GetAtt OriginAccessControl.Id
             S3OriginConfig:
               OriginAccessIdentity: ""
-          - !If
-            - HasApi
-            - Id: api
-              DomainName: !Ref ApiOriginDomain
-              CustomOriginConfig:
-                OriginProtocolPolicy: https-only
-                OriginSSLProtocols: [TLSv1.2]
-                # A cold start that also wakes a paused database takes ~20s.
-                OriginReadTimeout: 60
-            - !Ref AWS::NoValue
         DefaultCacheBehavior:
           TargetOriginId: s3-site
           ViewerProtocolPolicy: redirect-to-https
@@ -115,25 +147,29 @@ Resources:
           FunctionAssociations:
             - EventType: viewer-request
               FunctionARN: !GetAtt SpaRouting.FunctionARN
-        CacheBehaviors: !If
-          - HasApi
-          - - PathPattern: /api/*
-              TargetOriginId: api
-              ViewerProtocolPolicy: https-only
-              Compress: true
-              AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
-              CachedMethods: [GET, HEAD]
-              # Managed-CachingDisabled: every API call reaches the function.
-              CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
-              # Managed-AllViewerExceptHostHeader: a function URL only answers to
-              # its own hostname, so the viewer's Host must not be forwarded.
-              OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
-          - !Ref AWS::NoValue
-        ViewerCertificate:
-          CloudFrontDefaultCertificate: true
+        Aliases: !If [HasDomain, [!Ref FrontendDomain], !Ref AWS::NoValue]
+        ViewerCertificate: !If
+          - HasDomain
+          - AcmCertificateArn: !Ref Certificate
+            SslSupportMethod: sni-only
+            MinimumProtocolVersion: TLSv1.2_2021
+          - CloudFrontDefaultCertificate: true
       Tags:
         - Key: PROJECT_NAME
           Value: !Ref ProjectName
+
+  # Flat-rate Free plan: $0/month, no overage charges, activates immediately.
+  # An account may hold at most 3 Free plans. The references make CloudFormation
+  # create this last and delete it first.
+  PricingPlan:
+    Type: AWS::PricingPlanManager::Subscription
+    Properties:
+      PlanFamily: CloudFront
+      PlanTier: FREE
+      UsageLevel: DEFAULT
+      ResourceArns:
+        - !Sub "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}"
+        - !GetAtt WebAcl.Arn
 
   SiteBucketPolicy:
     Type: AWS::S3::BucketPolicy
@@ -161,4 +197,10 @@ Outputs:
     Value: !Ref Distribution
   SiteUrl:
     Description: Public URL of the deployed frontend.
-    Value: !Sub "https://${Distribution.DomainName}"
+    Value: !If
+      - HasDomain
+      - !Sub "https://${FrontendDomain}"
+      - !Sub "https://${Distribution.DomainName}"
+  DistributionDomain:
+    Description: What the FrontendDomain CNAME must point to.
+    Value: !GetAtt Distribution.DomainName
