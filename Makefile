@@ -149,6 +149,27 @@ infra-deploy: aws-check ## Create or update the S3 + CloudFront stack
 		echo "CloudFormation cannot update such a stack, so it has to go first."; \
 		$(MAKE) --no-print-directory purge-failed-stack; \
 	fi
+	@status=$$(aws cloudformation describe-stacks --stack-name $(STACK_NAME) \
+		--query "Stacks[0].StackStatus" --output text 2>/dev/null); \
+	case "$$status" in *_IN_PROGRESS) \
+		echo "Stack $(STACK_NAME) is $$status. Wait for it to finish (make frontend-status), then retry."; \
+		exit 1 ;; \
+	esac
+	@# CloudFront refuses an alias whose DNS already points at another distribution,
+	@# but only after minutes of creating. Catch it up front.
+	@if [ -n "$(FRONTEND_DOMAIN)" ] && command -v dig >/dev/null; then \
+		points=$$(dig +short "$(FRONTEND_DOMAIN)" CNAME | sed 's/\.$$//'); \
+		ours="$(filter-out None,$(call stack_output,DistributionDomain))"; \
+		case "$$points" in *.cloudfront.net) \
+			if [ "$$points" != "$$ours" ]; then \
+				echo "$(FRONTEND_DOMAIN) is a CNAME to $$points, another CloudFront distribution."; \
+				echo "CloudFront will not attach it here until that record is removed."; \
+				echo "Delete it at the DNS provider (keep the _…acm-validations.aws record),"; \
+				echo "wait for its TTL, and retry. Afterwards 'make frontend-dns' prints the new target."; \
+				exit 1; \
+			fi ;; \
+		esac; \
+	fi
 	@echo "Deploying stack $(STACK_NAME)…"
 	@test -z "$(FRONTEND_DOMAIN)" || echo "Waiting on the $(FRONTEND_DOMAIN) certificate: run 'make frontend-dns' in another terminal and add the records."
 	@aws cloudformation deploy \
